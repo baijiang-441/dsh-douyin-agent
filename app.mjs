@@ -147,6 +147,32 @@ export function createApiServer({ controller, config, personaMemory, watchServic
       if (url.pathname === '/api/interactions/state' && request.method === 'GET') return reply(response, 200, interactionSnapshot());
       if (url.pathname === '/api/interactions/configure' && request.method === 'POST') { await friendInteractions.configure(await readJson(request),{explicit:true}); return reply(response,200,interactionSnapshot()); }
       if (url.pathname === '/api/usage' && request.method === 'GET') return reply(response, 200, usageSnapshot());
+      // ng（2026-10-26）：本机命令收件——鱼侧命令支线的正式入口。落盘 command-inbox.jsonl 队列，鱼轮询消费并回执，
+      // 不与正在轮询的私信服务抢浏览器标签（text_send 的 CDP 冲突问题由此缓解）。
+      if (url.pathname === '/api/agent/command' && request.method === 'POST') {
+        const body = await readJson(request);
+        const command = typeof body.command === 'string' ? body.command.trim() : '';
+        if (!command || command.length > 200 || (body.args !== undefined && (typeof body.args !== 'object' || body.args === null || Array.isArray(body.args)))) return reply(response, 400, { error: '命令正文必填（≤200 字），args 如给出必须是对象。' });
+        const entry = { id: typeof body.id === 'string' && body.id.trim() ? body.id.trim().slice(0, 128) : randomUUID(), command, args: body.args ?? null, note: typeof body.note === 'string' ? body.note.slice(0, 500) : null, status: 'pending', createdAt: new Date().toISOString() };
+        const inbox = path.join(videoLimits.stateDir ?? resolveRuntimePaths().stateDir, 'command-inbox.jsonl');
+        if (!store.appendLineSync(inbox, JSON.stringify(entry))) return reply(response, 503, { error: '命令落盘失败（存储降级中），请稍后重试。', queued: false });
+        return reply(response, 200, { queued: true, id: entry.id, inbox: 'GET /api/agent/commands' });
+      }
+      if (url.pathname === '/api/agent/commands' && request.method === 'GET') {
+        const inbox = path.join(videoLimits.stateDir ?? resolveRuntimePaths().stateDir, 'command-inbox.jsonl');
+        const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50) || 50, 1), 200);
+        let commands = [];
+        try { commands = (await fs.readFile(inbox, 'utf8')).split('\n').filter(Boolean).slice(-500).map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        return reply(response, 200, { commands: commands.slice(-limit), total: commands.length });
+      }
+      if (url.pathname === '/api/agent/command/ack' && request.method === 'POST') {
+        const body = await readJson(request);
+        if (typeof body.id !== 'string' || !body.id.trim()) return reply(response, 400, { error: '必须提供要回执的命令 id。' });
+        const entry = { ackFor: body.id.trim().slice(0, 128), result: typeof body.result === 'string' ? body.result.slice(0, 2000) : null, ok: body.ok === true, status: 'done', ackedAt: new Date().toISOString() };
+        const inbox = path.join(videoLimits.stateDir ?? resolveRuntimePaths().stateDir, 'command-inbox.jsonl');
+        if (!store.appendLineSync(inbox, JSON.stringify(entry))) return reply(response, 503, { error: '回执落盘失败（存储降级中）。', acked: false });
+        return reply(response, 200, { acked: true, ackFor: entry.ackFor });
+      }
       if (url.pathname === '/api/diagnostics' && request.method === 'POST') { const body = await readJson(request); if (Object.keys(body).length) return reply(response, 400, { error: '自检不接收参数。' }); return reply(response, 200, await diagnostics.run()); }
       if (url.pathname === '/api/diagnostics/repair' && request.method === 'POST') return reply(response, 200, await diagnostics.repair(await readJson(request)));
       if (url.pathname === '/api/watch/options') {

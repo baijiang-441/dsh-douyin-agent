@@ -106,7 +106,11 @@
     "interaction-status.mjs",
     "assets/brand.ico",
     "assets/brand.png",
-    "assets/PROVENANCE.json"
+    "assets/PROVENANCE.json",
+    "lib/guards.mjs",
+    "lib/store.mjs",
+    "NG-BUILD.md",
+    "tests/ng-guards.test.mjs"
   ],
   "exports": {
     ".": "./dsh-plugin.mjs",

@@ -903,6 +903,8 @@ export class ChatBrowser {
           additionalCount: messages.filter(item => !known.has(item.id)).length, additionalClassifications: Object.fromEntries(['old-history', 'known-old-window', 'new-tail', 'ambiguous-new', 'baseline'].map(kind => [kind, messages.filter(item => !known.has(item.id) && item.arrivalClassification === kind).length])) };
         guardDiagnostic = diagnostic;
         if (messages.some(item => item.direction === 'unknown')) return false;
+        // ng 修复（2026-10-26，鱼实测反馈）：v2.2 重放时把旧版的时序校验一并删掉了；列表顺序无法判定（chronology 非 oldest-first）时不得发送，恢复护栏。
+        if (raw?.chronology !== 'oldest-first' || before.chronology !== 'oldest-first') return false;
         // 本地补丁 v2.2（2026-10-25，「认人不认水位」）的判定体已抽到 lib/guards.mjs 的 checkWatermark 纯函数并可单测；
         // 此处语义不变：只拦既有消息指纹变化与 expected 后缀断裂，新增消息（头部补载/尾部新到）不拦。
         const verdict = checkWatermark({ expectedIds: expected, expectedFingerprints: expected.map(id => known.get(id)), ids: messages.map(item => item.id), fingerprints: actual.map(item => item.fingerprint) });

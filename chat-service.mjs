@@ -449,7 +449,7 @@ export class ChatService {
       if (notSent) {mark.pending.phase = 'not-sent';if(mark.pending.recoveryEvidence)mark.pending.recoveryEvidence.beforeDispatch=true;}
       this.persist(); this.log(notSent ? 'reply.not_sent' : 'delivery.uncertain', { recipientId: contact.id, failureCode: delivery?.failureCode || null, failureStage: delivery?.failureStage || null, reason: delivery?.reason || null, guard: delivery?.guard || null }); return;
     }
-    mark.status = 'ready'; mark.reason = ''; mark.context.push({ id: delivery.messageId, sender: 'outgoing', text: reply.text }); mark.context = mark.context.slice(-12);
+    mark.status = 'ready'; mark.reason = ''; mark.context.push({ id: delivery.messageId, sender: 'outgoing', text: reply.text }); mark.context = mark.context.slice(-24);
     mark.seen.push(delivery.messageId); delete mark.pending; this.persist();
     this.log('reply.sent', { recipientId: contact.id, text: reply.text, messageId: delivery.messageId, usage: reply.usage });
   }
@@ -501,7 +501,7 @@ export class ChatService {
           if (unsupported.length) this.log('message.unsupported', { recipientId: contact.id, messageIds: unsupported.map((item) => item.id), message: '没有可靠消息采集证据的附件、撤回或未知消息已跳过。' });
           const needsManual=unsupported.filter(item=>item.nonReplyableNotice!==true&&!['recalled','withdrawn','system','system-notice'].includes(item.kind)&&!['recalled','withdrawn','system','system-notice'].includes(item.type)&&(contact.isGroup!==true||groupMessageAddressesFish(item,this.policy.groupMentionNames)));
           if(needsManual.length){archivePending(mark,{phase:'unsupported-media',incoming:needsManual.map(item=>({id:item.id,kind:item.kind||null,type:item.type||null,mediaType:item.media?.type||null,unsupported:true}))},'新消息包含尚未可靠采集的附件，未编造内容或假装已理解，请人工查看。');this.persist();}
-          mark.context = [...mark.context, ...fresh.filter((item) => ['incoming', 'outgoing'].includes(item.sender) && !unsupported.includes(item) && supported(item))].slice(-12); this.persist();
+          mark.context = [...mark.context, ...fresh.filter((item) => ['incoming', 'outgoing'].includes(item.sender) && !unsupported.includes(item) && supported(item))].slice(-24); this.persist();
           const incoming = fresh.filter((item) => item.sender === 'incoming' && !unsupported.includes(item) && (contact.isGroup !== true || groupMessageAddressesFish(item, this.policy.groupMentionNames)));
           if (!incoming.length) { if (fresh.some((item) => item.sender === 'outgoing') && mark.pending?.phase === 'superseded') { mark.pending.phase = 'handled-by-user'; this.persist(); this.log('reply.handled_by_user', { recipientId: contact.id }); } continue; }
           if (incoming.some((item) => item.eligibleForReply !== true&&!restoredIds.has(item.id))) { mark.pending = { phase: 'unqualified', incoming: incoming.map((item) => ({ id: item.id, text: item.text })), at: new Date().toISOString() }; throw new Error('新消息尚未取得可靠的新到达资格，联系人已暂停。'); }

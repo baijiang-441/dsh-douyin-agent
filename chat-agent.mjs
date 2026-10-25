@@ -34,7 +34,8 @@ export class ChatAgent {
   async reply({ messages, mediaObservations = [], conversation, signal } = {}) {
     if (!this.config.apiKey && !this.replyProvider) throw new Error('未配置 DeepSeek API Key。');
     if (!Array.isArray(messages) || !messages.length || messages.at(-1)?.sender !== 'incoming') throw new Error('私信回复需要当前联系人的新收到消息。');
-    const content = messages.slice(-12).filter((message) => ['incoming', 'outgoing'].includes(message.sender) && (message.text?.trim() || message.media))
+    // ng（2026-10-26）：私信上下文窗口 12 → 24 条，配合「抖音回复过大脑」——桥的 pending 提示词带更长对话史，鱼回复时读全文。
+    const content = messages.slice(-24).filter((message) => ['incoming', 'outgoing'].includes(message.sender) && (message.text?.trim() || message.media))
       .map((message) => ({ role: message.sender === 'incoming' ? 'user' : 'assistant', content: redact(message.text?.trim() || JSON.stringify({messageId:message.id,media:{type:message.media.type,label:message.media.label,title:message.media.title,author:message.media.author,isPhotoGallery:message.media.isPhotoGallery,understandingScope:message.media.understandingScope}}), [this.config.apiKey]).slice(0, 1800) }));
     if (!content.length) throw new Error('没有可回复的消息正文。');
     const parts=[]; let frameCount=0;

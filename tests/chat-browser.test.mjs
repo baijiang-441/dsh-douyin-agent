@@ -447,7 +447,9 @@ test('发送trial前补载可信旧前缀且保留最新锚点和全部重叠内
   } finally { await chat.close(); }
 });
 
-test('虚拟列表空窗、丢失最新锚点、新增、修改或重排都不能利用后缀兼容继续发送', async () => {
+// ng（2026-10-26）：随本地补丁 v2.2「认人不认水位」更新——填写期间尾部新到消息不再拦截（本轮照发，补扫轮再回）；
+// 空窗、丢锚点、内容修改、重排、顺序未知仍然全拦（顺序未知护栏由 ng 修复恢复）。
+test('虚拟列表空窗、丢失最新锚点、修改、重排或顺序未知都不能利用后缀兼容继续发送；尾部新到消息放行', async () => {
   for (const mode of ['empty', 'lost-latest', 'new-message', 'modified', 'reordered', 'unverified-order']) {
     const { page, chat } = await fixture();
     try {
@@ -465,7 +467,11 @@ test('虚拟列表空窗、丢失最新锚点、新增、修改或重排都不�
       }, mode);
       const contact = (await chat.listContacts()).contacts[0], before = await chat.readConversation(contact.id, { allowed: true });
       const result = await chat.sendMessage(contact.id, '不能越过水位检查的合成回复', { allowed: true, expectedMessageIds: before.messages.map(row => row.id) });
-      assert.equal(result.confirmed, false, mode); assert.equal(result.deliveryUncertain, false, mode); assert.equal(await page.evaluate(() => window.sent), 0, mode); assert.equal(result.failureCode, 'CHAT_WATERMARK_CHANGED', mode);
+      if (mode === 'new-message') {
+        assert.equal(result.confirmed, true, mode); assert.equal(await page.evaluate(() => window.sent), 1, mode);
+      } else {
+        assert.equal(result.confirmed, false, mode); assert.equal(result.deliveryUncertain, false, mode); assert.equal(await page.evaluate(() => window.sent), 0, mode); assert.equal(result.failureCode, 'CHAT_WATERMARK_CHANGED', mode);
+      }
     } finally { await chat.close(); }
   }
 });
@@ -788,7 +794,8 @@ test('已有草稿或发送按钮不唯一时不点击发送', async () => {
   } finally { await chat.close(); }
 });
 
-test('预期私信水位或填写期间消息变化时不点击发送', async () => {
+// ng（2026-10-26）：水位完全不符仍不点击；「填写期间尾部新到消息」随 v2.2「认人不认水位」改为放行——本轮照发，补扫轮再回新消息。
+test('预期私信水位不符时不点击发送；填写期间尾部新到消息放行照发', async () => {
   const { page, chat } = await fixture();
   try {
     const { contacts } = await chat.listContacts();
@@ -796,15 +803,15 @@ test('预期私信水位或填写期间消息变化时不点击发送', async ()
     const wrong = await chat.sendMessage(contacts[0].id, '合成回复', { allowed: true, expectedMessageIds: ['msg:其他水位'] });
     assert.equal(wrong.confirmed, false);
     assert.equal(wrong.deliveryUncertain, false);
+    assert.equal(await page.evaluate(() => window.sent), 0);
     await page.evaluate(() => document.querySelector('[contenteditable]').addEventListener('input', () => {
       const newRow = document.createElement('div'); newRow.setAttribute('data-index', '1');
       newRow.innerHTML = '<div class="messageMessageBoxmessageBox"><div data-e2e="msg-item-content"><div class="MessageItemTextcontainer">填写期间的新消息</div></div></div>';
       document.getElementById('message-list').append(newRow);
     }, { once: true }));
     const changed = await chat.sendMessage(contacts[0].id, '合成回复', { allowed: true, expectedMessageIds: before.messages.map(item => item.id) });
-    assert.equal(changed.confirmed, false);
-    assert.equal(changed.deliveryUncertain, false);
-    assert.equal(await page.evaluate(() => window.sent), 0);
+    assert.equal(changed.confirmed, true);
+    assert.equal(await page.evaluate(() => window.sent), 1);
   } finally { await chat.close(); }
 });
 
