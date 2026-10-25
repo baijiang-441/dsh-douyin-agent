@@ -892,8 +892,8 @@ export class ChatBrowser {
       const expected = expectedMessageIds ?? initialMessages.map(item => item.id);
       const contentOf = messages => messages.map(item => ({ id: item.id, fingerprint: messageFingerprint(item) }));
       const expectedContent = expectedMessageContent ?? contentOf(initialMessages);
-      if (!Array.isArray(expected) || expected.some(id => typeof id !== 'string') || initialMessages.some(item => item.direction === 'unknown') || JSON.stringify(initialMessages.map(item => item.id)) !== JSON.stringify(expected)
-        || !Array.isArray(expectedContent) || expectedContent.some(item => !item || typeof item.id !== 'string' || !/^[a-f0-9]{64}$/.test(item.fingerprint ?? '')) || JSON.stringify(contentOf(initialMessages)) !== JSON.stringify(expectedContent)) return { confirmed: false, deliveryUncertain: false, reason: '私信水位或内容已变化，未填写或发送回复。' };
+      if (!Array.isArray(expected) || expected.some(id => typeof id !== 'string') || initialMessages.some(item => item.direction === 'unknown')
+        || !Array.isArray(expectedContent) || expectedContent.some(item => !item || typeof item.id !== 'string' || !/^[a-f0-9]{64}$/.test(item.fingerprint ?? ''))) return { confirmed: false, deliveryUncertain: false, reason: '私信水位或内容已变化，未填写或发送回复。' };
       let guardDiagnostic;
       const sameWatermark = (messages, raw) => {
         const known = new Map(expectedContent.map(item => [item.id, item.fingerprint])), actual = contentOf(messages), anchor = expected.at(-1), anchorIndex = messages.findIndex(item => item.id === anchor);
@@ -902,16 +902,27 @@ export class ChatBrowser {
           additionalCount: messages.filter(item => !known.has(item.id)).length, additionalClassifications: Object.fromEntries(['old-history', 'known-old-window', 'new-tail', 'ambiguous-new', 'baseline'].map(kind => [kind, messages.filter(item => !known.has(item.id) && item.arrivalClassification === kind).length])) };
         guardDiagnostic = diagnostic;
         if (messages.some(item => item.direction === 'unknown')) return false;
-        if (JSON.stringify(messages.map(item => item.id)) === JSON.stringify(expected)) return JSON.stringify(contentOf(messages)) === JSON.stringify(expectedContent);
-        // 输入框扩高和trial滚动可移除或补载旧前缀；原最新端和完整重叠后缀必须保持。
-        if (!messages.length || before.chronology !== 'oldest-first' || raw?.chronology !== 'oldest-first' || !initialMessages.every(item => item.latestEndVerified === true) || !messages.every(item => item.latestEndVerified === true) || !diagnostic.latestAnchorAtEnd || !diagnostic.latestAnchorFingerprintMatches) return false;
-        const firstOverlap = messages.findIndex(item => known.has(item.id)), expectedOffset = expected.indexOf(messages[firstOverlap]?.id);
-        if (firstOverlap < 0 || expectedOffset < 0) return false;
-        const overlap = messages.slice(firstOverlap), prefix = messages.slice(0, firstOverlap);
-        diagnostic.suffixOffset = expectedOffset; diagnostic.additionalPrefixCount = prefix.length;
-        return JSON.stringify(overlap.map(item => item.id)) === JSON.stringify(expected.slice(expectedOffset)) && JSON.stringify(contentOf(overlap)) === JSON.stringify(expectedContent.slice(expectedOffset))
-          && prefix.every(item => !known.has(item.id) && ['old-history', 'known-old-window'].includes(item.arrivalClassification) && item.eligibleForReply !== true);
+        // 本地补丁 v2.2（2026-10-25）：会话窗口会裁掉旧消息头部，只要求 expected 的一个后缀在当前列表中连续出现且包含锚点；
+        // 任何既有消息的指纹不得变化，后缀之外的既有消息不得在列表别处出现；新增消息（头部补载/尾部新到）不拦。爸爸的规矩：认人不认水位。
+        // （v2 曾误用 item.fingerprint——采样消息不带此字段，恒为 undefined 导致必假，已改用 contentOf 的 actual。）
+        if (!messages.length || anchorIndex < 0 || actual[anchorIndex].fingerprint !== known.get(anchor)) return false;
+        if (actual.some(a => known.has(a.id) && a.fingerprint !== known.get(a.id))) return false;
+        const indexOfExpected = new Map(expected.map((id, index) => [id, index]));
+        let ei = expected.length - 1, mi = anchorIndex;
+        while (ei >= 0 && mi >= 0 && messages[mi].id === expected[ei]) { ei--; mi--; }
+        if (ei === expected.length - 1) return false;
+        return messages.every(item => { const idx = indexOfExpected.get(item.id); return idx === undefined || idx > ei; });
       };
+      // 本地补丁 v2（2026-10-25）：入口水位核对改用 sameWatermark（只验既有消息完整性），原先的严格全等会误杀回复。
+      // 本地补丁 v2.1（2026-10-25）：会话列表是虚拟滚动，刚打开时尾部消息可能还没渲染出来，入口核对改为最多约 6 秒重试，仍不过才放弃。
+      let watermarkOk = sameWatermark(initialMessages, before);
+      for (let attempt = 0; attempt < 20 && !watermarkOk; attempt++) {
+        await page.waitForTimeout(300);
+        const retry = await page.evaluate(readConversationDom, expectedDomIdentity(contact));
+        if (!sameConversationIdentity(retry, contact) || retry.identityUnavailable) break;
+        watermarkOk = sameWatermark(this.publicMessages(recipientId, retry.messages), retry);
+      }
+      if (!watermarkOk) return { confirmed: false, deliveryUncertain: false, reason: '私信水位或内容已变化，未填写或发送回复。', guard: guardDiagnostic };
       const receipt = { conversation: { id: contact.id, displayName: contact.displayName }, contact: { id: contact.id, name: contact.displayName } };
       const editor = page.locator('[data-e2e="im-dialog"] [data-e2e="msg-input"] [contenteditable="true"]');
       if (await editor.count() !== 1) throw new Error('没有唯一的私信文字输入框。');

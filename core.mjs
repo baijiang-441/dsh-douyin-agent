@@ -441,6 +441,7 @@ export class BrowserController {
         const page=await this.connect(signal);
         aborted(signal);
         if (['api', 'dsh'].includes(this.source)) await (await this.getWatchMode()).apply(page);
+        if (['api', 'dsh'].includes(this.source)) { try { await page.bringToFront(); } catch {} }
         if(new URL(page.url()).origin!=='https://www.douyin.com') throw new Error('专用标签页已离开抖音，请重新打开抖音后操作。');
         return await callback(page,signal);
       }finally{signal?.removeEventListener('abort',onAbort);release();}

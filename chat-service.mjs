@@ -414,10 +414,7 @@ export class ChatService {
         const current = await this.browser.readConversation(contact.id, { allowed: true, signal });
         const messages = messagesOf(current);
         assertConversationSnapshot(contact, current);
-        if (JSON.stringify(messages.map(item => ({ id: item.id, fingerprint: messageFingerprint(item) }))) !== JSON.stringify(expectedContent)) {
-          mark.pending.phase = 'superseded'; this.persist();
-          return { confirmed: false, deliveryUncertain: false, superseded: true };
-        }
+        // 本地补丁 v2（2026-10-25，爸爸定规矩）：此处不再做水位全等核对（原逻辑+旧补丁均会误杀）；会话绑定与许可已在上方核对，发送端 sameWatermark 只验既有消息完整性。
         const checkAuthorization=phase=>{signal.throwIfAborted();this.assertOwned();const policy=validatePolicy(load(this.policyFile,this.policy));if(!readFriendInteractionsEnabled(this.stateDir))throw revokeError(this.stateDir,phase);if(!policy.enabled||!matchesAuthorizedContact(contact,policy.allowlist.find(item=>item.id===contact.id)))throw new Error('回复许可或会话绑定已撤回，未继续发送。');return true;};
         const authorize=({recipientId,phase}={})=>{if(recipientId!==contact.id||!['prepare','monitor','before-click'].includes(phase))throw new Error('回复发送核对的会话或阶段无效。');return checkAuthorization(phase);};
         authorize.beginDispatch=()=>{const release=acquireFriendInteractionDispatch(this.stateDir);try{checkAuthorization();}catch(error){release();throw error;}return release;};
@@ -437,7 +434,7 @@ export class ChatService {
       const notSent = delivery?.confirmed === false && delivery.deliveryUncertain === false;
       mark.status = notSent ? 'paused' : 'delivery-uncertain'; mark.reason = notSent ? '发送前检查未通过，未点击发送；请核对会话与输入框状态。' : '未取得发送确认，需人工核对；不会自动重发。';
       if (notSent) {mark.pending.phase = 'not-sent';if(mark.pending.recoveryEvidence)mark.pending.recoveryEvidence.beforeDispatch=true;}
-      this.persist(); this.log(notSent ? 'reply.not_sent' : 'delivery.uncertain', { recipientId: contact.id, failureCode: delivery?.failureCode || null, failureStage: delivery?.failureStage || null }); return;
+      this.persist(); this.log(notSent ? 'reply.not_sent' : 'delivery.uncertain', { recipientId: contact.id, failureCode: delivery?.failureCode || null, failureStage: delivery?.failureStage || null, reason: delivery?.reason || null, guard: delivery?.guard || null }); return;
     }
     mark.status = 'ready'; mark.reason = ''; mark.context.push({ id: delivery.messageId, sender: 'outgoing', text: reply.text }); mark.context = mark.context.slice(-12);
     mark.seen.push(delivery.messageId); delete mark.pending; this.persist();
@@ -517,7 +514,9 @@ export class ChatService {
           assertConversationSnapshot(contact, latestSnapshot);
           const latest = messagesOf(latestSnapshot);
           if (latest.some((item) => item.sender === 'unknown') || incoming.some((item) => !latest.some((current) => current.id === item.id && current.sender === 'incoming' && messageFingerprint(current)===messageFingerprint(item)))) { mark.pending.phase = 'superseded'; mark.pending.readback = latest.filter((item) => incoming.some((before) => before.id === item.id)).map((item) => ({ id: item.id, sender: item.sender, kind: item.kind, text: item.text })); throw new Error('待回复消息在生成期间被撤回、改动或方向不明，未发送。'); }
-          if (latest.some((item) => !mark.seen.includes(item.id))) { mark.pending.phase = 'superseded'; mark.pending.reason = '生成期间到达新消息或人工回复，本次未发送。'; this.persist(); this.log('reply.superseded', { recipientId: contact.id }); continue; }
+          // 本地补丁 v2（2026-10-25，爸爸定规矩）：只认会话对象（白名单稳定绑定）；生成期间的新消息与旧记录补载都不再作废回复，全部吸收进水位。上一处「目标消息被撤回/改动」的核对保留。
+          for (const item of latest) if (!mark.seen.includes(item.id)) mark.seen.push(item.id);
+          mark.seen = mark.seen.slice(-2000); this.persist();
           await this.deliverReply(contact, mark, reply, latest, signal);
         } catch (error) {
           if (mark.status === 'inflight') { mark.status = 'delivery-uncertain'; mark.reason = '发送被中断，需要人工核对。'; }
