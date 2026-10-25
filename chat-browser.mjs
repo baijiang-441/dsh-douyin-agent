@@ -9,6 +9,7 @@ import { messageFingerprint } from './chat-message.mjs';
 import { MessageIdentityTracker } from './message-tracker.mjs';
 import { matchesAuthorizedContact } from './contact-authorization.mjs';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
+import { checkWatermark } from './lib/guards.mjs';
 export { MessageIdentityTracker } from './message-tracker.mjs';
 
 const HOME = 'https://www.douyin.com/?recommend=1&from_nav=1';
@@ -902,16 +903,11 @@ export class ChatBrowser {
           additionalCount: messages.filter(item => !known.has(item.id)).length, additionalClassifications: Object.fromEntries(['old-history', 'known-old-window', 'new-tail', 'ambiguous-new', 'baseline'].map(kind => [kind, messages.filter(item => !known.has(item.id) && item.arrivalClassification === kind).length])) };
         guardDiagnostic = diagnostic;
         if (messages.some(item => item.direction === 'unknown')) return false;
-        // 本地补丁 v2.2（2026-10-25）：会话窗口会裁掉旧消息头部，只要求 expected 的一个后缀在当前列表中连续出现且包含锚点；
-        // 任何既有消息的指纹不得变化，后缀之外的既有消息不得在列表别处出现；新增消息（头部补载/尾部新到）不拦。爸爸的规矩：认人不认水位。
-        // （v2 曾误用 item.fingerprint——采样消息不带此字段，恒为 undefined 导致必假，已改用 contentOf 的 actual。）
-        if (!messages.length || anchorIndex < 0 || actual[anchorIndex].fingerprint !== known.get(anchor)) return false;
-        if (actual.some(a => known.has(a.id) && a.fingerprint !== known.get(a.id))) return false;
-        const indexOfExpected = new Map(expected.map((id, index) => [id, index]));
-        let ei = expected.length - 1, mi = anchorIndex;
-        while (ei >= 0 && mi >= 0 && messages[mi].id === expected[ei]) { ei--; mi--; }
-        if (ei === expected.length - 1) return false;
-        return messages.every(item => { const idx = indexOfExpected.get(item.id); return idx === undefined || idx > ei; });
+        // 本地补丁 v2.2（2026-10-25，「认人不认水位」）的判定体已抽到 lib/guards.mjs 的 checkWatermark 纯函数并可单测；
+        // 此处语义不变：只拦既有消息指纹变化与 expected 后缀断裂，新增消息（头部补载/尾部新到）不拦。
+        const verdict = checkWatermark({ expectedIds: expected, expectedFingerprints: expected.map(id => known.get(id)), ids: messages.map(item => item.id), fingerprints: actual.map(item => item.fingerprint) });
+        diagnostic.verdict = verdict.reason; diagnostic.matchedUntil = verdict.matchedUntil;
+        return verdict.ok;
       };
       // 本地补丁 v2（2026-10-25）：入口水位核对改用 sameWatermark（只验既有消息完整性），原先的严格全等会误杀回复。
       // 本地补丁 v2.1（2026-10-25）：会话列表是虚拟滚动，刚打开时尾部消息可能还没渲染出来，入口核对改为最多约 6 秒重试，仍不过才放弃。

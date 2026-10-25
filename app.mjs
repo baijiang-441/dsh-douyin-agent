@@ -20,6 +20,7 @@ import { WatchOptions } from './watch-options.mjs';
 import { DiagnosticsService } from './diagnostics.mjs';
 import { DailyReport } from './daily-report.mjs';
 import { isStoredContactAuthorized, matchesAuthorizedContact } from './contact-authorization.mjs';
+import { store, boot } from './lib/store.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -118,6 +119,12 @@ export function createApiServer({ controller, config, personaMemory, watchServic
   const server = http.createServer(async (request, response) => {
     try {
       const origin = `http://127.0.0.1:${server.address()?.port || port}`;
+      const healthSnapshot = () => {
+        let chat = null;
+        try { const state = typeof chatService?.state === 'function' ? chatService.state() : null; chat = state ? { running: state.running, starting: state.starting, busy: state.busy, contacts: (state.contacts || []).map(item => ({ id: item.id, status: item.status })) } : null; }
+        catch { chat = { unavailable: true }; }
+        return { service: 'douyin-api-local', version: 1, ng: 'ng-20261026', uptimeSeconds: Math.round((Date.now() - boot.startedAt) / 1000), phase: boot.phase, storage: store.healthSnapshot(), chat };
+      };
       const hostCount = request.rawHeaders.filter((_item, index) => index % 2 === 0 && request.rawHeaders[index].toLowerCase() === 'host').length;
       if (!['127.0.0.1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress) || hostCount !== 1 || request.headers.host !== new URL(origin).host) return reply(response, 403, { error: '只接受本机 127.0.0.1 地址。' });
       if ((request.headers.origin && request.headers.origin !== origin) || ['cross-site', 'same-site'].includes(request.headers['sec-fetch-site'])) return reply(response, 403, { error: '拒绝跨来源请求。' });
@@ -125,6 +132,8 @@ export function createApiServer({ controller, config, personaMemory, watchServic
       if (url.origin !== origin) return reply(response, 403, { error: '请求地址与本机服务不一致。' });
       if (stopping) return reply(response, 503, { error: '本机服务正在退出。' });
       if (request.method === 'GET' && url.pathname === '/') return reply(response, 200, await fs.readFile(htmlFile), 'text/html; charset=utf-8');
+      // ng（2026-10-26）：无鉴权的最小健康端点，供 20 分钟自动重试探针、端口仲裁与鱼侧巡检使用。
+      if (request.method === 'GET' && url.pathname === '/api/health') return reply(response, 200, healthSnapshot());
       if (request.method === 'GET' && url.pathname === '/api/bootstrap') {
         const memory = resolveRuntimePaths();
         return reply(response, 200, { service: 'douyin-api-local', version: 1, sections: SETTINGS_SECTIONS, token, videoTime: { enabled: Boolean(videoLimits) }, media: { available: Boolean(mediaAdapter) }, watch: { available: Boolean(watchService) }, share: { available: Boolean(shareService) }, spark: { available: false }, comments: { available: Boolean(commentService) }, reports: { available: Boolean(reportService) }, mode: { available: Boolean(modeService) }, persona: { available: Boolean(personaMemory) }, forward: { available: Boolean(chatService && videoLimits) }, config: redact(publicApiConfig(config), [config.apiKey]), limits: { maxSteps: agent.maxSteps ?? DEFAULT_LIMITS.maxSteps, maxToolCalls: agent.maxToolCalls ?? DEFAULT_LIMITS.maxToolCalls, taskTimeoutSeconds: (agent.taskTimeoutMs ?? DEFAULT_LIMITS.taskTimeoutMs) / 1_000, apiTimeoutSeconds: (agent.apiTimeoutMs ?? DEFAULT_LIMITS.apiTimeoutMs) / 1_000, maxTokens: agent.maxTokens ?? DEFAULT_LIMITS.maxTokens, maxFrames: agent.maxFrames ?? DEFAULT_LIMITS.maxFrames }, memory: { description: '与 QQ 机器人共享的记忆 / 视频笔记。具体连通状态以检索结果为准。', folder: memory.memoryDir, database: memory.memoryDbPath } });
@@ -473,6 +482,24 @@ export function stopApiServer(server) {
 
 export async function startApiServer({ port = Number(process.env.DOUYIN_API_PORT || 3218), config = loadApiConfig(), controller, chatService, videoLimits = new VideoLimits(), mediaAdapter, personaMemory, watchService, shareService, sparkService, commentService, reportService, modeService, taskLimits, htmlFile, staticRoot } = {}) {
   if (!Number.isInteger(port) || (port !== 0 && port < 1024) || port > 65535) throw new Error('端口须为 0，或 1024 至 65535 的整数。');
+  // ng 启动序（2026-10-26）：先存储探针、再端口仲裁，任何一步失败都给出明确阶段并按约定退出码结束，不静默卡死。
+  boot.phase = 'storage-probe';
+  const probe = store.probeSync(resolveRuntimePaths().stateDir);
+  if (!probe.ok) {
+    boot.phase = 'storage-blocked'; boot.detail = probe.code || 'probe-failed';
+    console.error(`启动失败：状态目录不可写（${probe.code}）。平台写隔离未解除或磁盘异常；以退出码 78 结束，等待下一轮自动重试探针。`);
+    process.exit(78);
+  }
+  boot.phase = 'port-check';
+  if (port !== 0) {
+    const occupied = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1200) }).then(() => true, () => false);
+    if (occupied) {
+      boot.phase = 'port-in-use';
+      console.error(`端口 ${port} 已有实例在响应（旧树自动重试可能先拉起）。本进程让位退出，不抢占。`);
+      process.exit(0);
+    }
+  }
+  boot.phase = 'services';
   if (!controller) {
     const { BrowserController } = await import('./core.mjs');
     controller = new BrowserController({ source: 'api', videoLimits });
@@ -512,6 +539,8 @@ export async function startApiServer({ port = Number(process.env.DOUYIN_API_PORT
   }
   server.watchSchedule.start();
   void server.friendInteractions.start();
+  boot.phase = 'ready';
+  store.startFlushLoop(10_000);
   console.log(`大肥鱼 · 视频助手：http://127.0.0.1:${server.address().port}`);
   console.log(`模型：${config.model}；凭据：${config.apiKey ? '已在内存读取' : '未配置'}`);
   const signalHandlers = ['SIGINT', 'SIGTERM'].map(signal => {

@@ -9,12 +9,13 @@ import { messageFingerprint } from './chat-message.mjs';
 import { OutboundCoordinator } from './outbound-send.mjs';
 import { canAuthorizeConversation, hasStableConversationIdentity, isStoredContactAuthorized, matchesAuthorizedContact, upgradeAuthorizedContact } from './contact-authorization.mjs';
 import { groupMessageAddressesFish, normalizeMentionNames } from './group-reply-trigger.mjs';
+import { store } from './lib/store.mjs';
 
 const basePolicy = () => ({ version: 1, enabled: false, allowlist: [], dailyReplyLimit: null });
 const dayKey = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 const load = (file, fallback) => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : fallback;
 const alive = (pid) => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
-function save(file, value) { fs.mkdirSync(path.dirname(file), { recursive: true }); const temporary = `${file}.${process.pid}.tmp`; fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 }); fs.renameSync(temporary, file); }
+function save(file, value) { store.writeJSONSync(file, value); }
 function initialize(file, value) { fs.mkdirSync(path.dirname(file), { recursive: true }); let descriptor; try { descriptor = fs.openSync(file, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') return; throw error; } try { fs.writeFileSync(descriptor, JSON.stringify(value, null, 2)); } finally { fs.closeSync(descriptor); } }
 function recentEvents(file) {
   if (!fs.existsSync(file)) return [];
@@ -150,6 +151,18 @@ export class ChatService {
         this.assertOwned();
         const request = load(this.stopFile, null);
         if (request?.targetRunId === this.runId && (this.running || this.starting)) this.stop({preservePending:request.preservePending===true,reason:request.reason});
+        // ng 看门狗（2026-10-26）：pending 卡在 model（桥窗口私信 60 秒）或 observing（语音转写有界）
+        // 远超时限仍未返回时，中断本轮让联系人回到 paused；不再出现 busy 不退、pending 永卡 model。
+        const stuckLimitFor = phase => phase === 'model' ? 120_000 : 300_000;
+        for (const [id, mark] of Object.entries(this.watermarks?.contacts || {})) {
+          const phase = mark?.pending?.phase;
+          if (!phase || !['model', 'observing'].includes(phase)) continue;
+          const since = Date.parse(mark.pending.at || '');
+          if (!Number.isFinite(since) || Date.now() - since <= stuckLimitFor(phase)) continue;
+          this.log('watchdog.pending_stuck', { recipientId: id, phase, since: mark.pending.at, message: '等待远超时限仍未返回，看门狗中断本轮；常见于存储被平台拦截或桥挂起。' });
+          this.abort?.abort(new Error('等待回复超时，看门狗中断本轮。'));
+          break;
+        }
         if (this.runId) this.control(() => { this.assertOwned(); save(this.lockFile, { pid: process.pid, runId: this.runId, heartbeatAt: new Date().toISOString(), status: this.running ? 'running' : this.starting ? 'starting' : 'stopping' }); });
         if (!this.running && !this.busy && !this.starting) this.release();
       } catch (error) { if (error.code !== 'CHAT_CONTROL_BUSY') this.log('worker.control_error', { message: error.message }); }

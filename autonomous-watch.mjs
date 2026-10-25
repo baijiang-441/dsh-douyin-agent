@@ -218,7 +218,12 @@ export class AutonomousWatch {
         observation = { ...observation, ...(viewing ? { viewing } : {}) };
         let audioNote = '';
         try {
-          const listened = await this.execute('douyin_listen', { seconds: 8 });
+          // ng（2026-10-26）：listen 全程加 25 秒硬预算（8 秒录音 + 本地 Whisper 冷启动转写的上界）；
+          // 转写挂起时按无音频继续，不拖死整轮。桥的 50 秒决策窗口独立计时，不受此影响。
+          const listened = await Promise.race([
+            this.execute('douyin_listen', { seconds: 8 }).catch(() => null),
+            new Promise(resolve => { const timer = setTimeout(() => resolve(null), 25_000); timer.unref?.(); })
+          ]);
           const transcript = typeof listened?.audio?.text === 'string' ? listened.audio.text.trim() : '';
           if (listened?.ok && transcript) audioNote = `\n\n本条音频转写（本地 Whisper，可能有识别误差）：${transcript}`;
         } catch {}

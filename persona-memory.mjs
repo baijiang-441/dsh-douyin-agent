@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
+import { store } from './lib/store.mjs';
 
 export const LEGACY_ROLE_CARD_FILE = 'D:/codex分局/大肥鱼/persona/role-card.md';
 export const GENERATED_START = '<!-- DOUYIN_PERSONA_GENERATED:START -->';
@@ -228,8 +229,13 @@ export class PersonaMemory {
       // 恢复者之间也互斥；取得恢复权后重读，不使用等待阶段见到的旧 owner。
       const raw = read(this.lockFile, 1024, true);
       if (raw === null) return true;
-      const lock = JSON.parse(raw);
-      if (Number.isSafeInteger(lock.pid) && lock.pid > 0 && !alive(lock.pid) && read(this.lockFile, 1024, true) === raw) { fs.unlinkSync(this.lockFile); return true; }
+      let lock = null;
+      try { lock = JSON.parse(raw); } catch { lock = null; }
+      const pidValid = lock && Number.isSafeInteger(lock.pid) && lock.pid > 0;
+      if (pidValid && !alive(lock.pid) && read(this.lockFile, 1024, true) === raw) { fs.unlinkSync(this.lockFile); return true; }
+      // ng 修复（2026-10-26）：0 字节/半截/无 pid 的坏锁不能证明持有者存活；锁是毫秒级写完的小文件，
+      // 停留超过 5 秒仍是坏内容即按死锁回收。原逻辑对坏锁永远返回 false，是 23:45 写隔离故障里启动卡死的直接死点。
+      if (!pidValid && Date.now() - fs.statSync(this.lockFile).mtimeMs > 5000 && read(this.lockFile, 1024, true) === raw) { fs.unlinkSync(this.lockFile); return true; }
       return false;
     } catch (failure) { if (failure.code === 'ENOENT') return true; return false; }
     finally { if (read(this.recoveryFile, 1024, true) === owner) fs.unlinkSync(this.recoveryFile); }
@@ -257,7 +263,8 @@ export class PersonaMemory {
   writeState(state) {
     const raw = JSON.stringify(state, null, 2) + '\n';
     if (Buffer.byteLength(raw) > MAX_STATE_BYTES) throw error('PERSONA_CAPACITY', '人格证据达到文件上限，本次没有丢弃旧证据或伪造保存。');
-    atomic(this.stateFile, raw);
+    // ng（2026-10-26）：经统一存储层写入，EPERM 类平台拦截在退避重试后转入内存缓冲，不让观看/记录轮次直接死。
+    store.writeSync(this.stateFile, raw);
   }
   syncCard(state) {
     const raw = read(this.roleCardFile, MAX_CARD_BYTES, true);
@@ -265,7 +272,14 @@ export class PersonaMemory {
     const next = assemble(cardParts(raw), state);
     if (Buffer.byteLength(next) > MAX_CARD_BYTES) throw error('PERSONA_CAPACITY', '人格卡超过长度上限，已保留手编内容。');
     if (read(this.roleCardFile, MAX_CARD_BYTES, true) !== raw) throw error('PERSONA_REVISION_CONFLICT', '人格卡刚被手工修改，请重新读取后再更新。');
-    if (next !== raw) atomic(this.roleCardFile, next, { expected: raw });
+    if (next !== raw) {
+      try { atomic(this.roleCardFile, next, { expected: raw }); }
+      catch (failure) {
+        if (!['EPERM', 'EACCES', 'EROFS', 'ENOSPC', 'EBUSY', 'ETXTBSY', 'EIO'].includes(failure.code)) throw failure;
+        // ng（2026-10-26）：写不进去时把拟写入内容转入存储层缓冲，存储恢复后回放最新一份；不阻塞本轮。
+        store.deferWrite(this.roleCardFile, next);
+      }
+    }
     return true;
   }
   initialize({ importLegacy = false } = {}) {
