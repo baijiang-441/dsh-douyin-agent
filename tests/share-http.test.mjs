@@ -22,7 +22,8 @@ async function fixture(t, send = async () => { throw new Error('设置接口不�
   const shareService = new AutonomousShare({ personaMemory, videoLimits, stateDir, now, send });
   let browserCalls = 0, closed = 0;
   const controller = { execute: async () => { browserCalls++; throw new Error('设置接口不能进入浏览器'); }, close: async () => { closed++; } };
-  const server = createApiServer({ controller, config: { apiKey: '', model: 'synthetic-model' }, personaMemory, shareService, videoLimits, pauseVideoSources: async () => {}, port: 0 });
+  const chatService={state:()=>({running:false,policy:{allowlist:[{id:friend}],groupMentionNames:['大肥鱼']},contacts:[]}),start:async()=>{throw new Error('没有配置模型，禁止启动');},stop:async()=>{},close:async()=>{}};
+  const server = createApiServer({ controller, chatService, config: { apiKey: '', model: 'synthetic-model' }, personaMemory, shareService, videoLimits, pauseVideoSources: async () => {}, port: 0 });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const origin = `http://127.0.0.1:${server.address().port}`, bootstrap = await (await fetch(origin + '/api/bootstrap')).json();
   const request = async (route, body, headers = {}) => {
@@ -39,9 +40,9 @@ test('分享设置HTTP要求本机token和同源，只接受开关与预算，�
   assert.equal((await fetch(f.origin + '/api/share/state')).status, 403);
   assert.equal((await f.request('/api/share/configure', { enabled: true }, { origin: 'https://untrusted.example' })).status, 403);
   assert.equal((await f.request('/api/share/configure', { enabled: true }, { 'sec-fetch-site': 'same-site' })).status, 403);
-  const initial = await f.request('/api/share/state'); assert.equal(initial.body.enabled, false); assert.equal(initial.body.dailyLimit, 3);
-  for (const body of [{ enabled: true, recipientId: friend }, { enabled: true, dailyLimit: 21 }, { enabled: true, url: 'https://www.douyin.com/video/999' }, { dailyLimit: 3 }]) assert.equal((await f.request('/api/share/configure', body)).status, 400);
-  const configured = await f.request('/api/share/configure', { enabled: true, dailyLimit: 4 }); assert.equal(configured.status, 200); assert.equal(configured.body.dailyLimit, 4); assert.equal(configured.body.recipients[0].id, friend);
+  const initial = await f.request('/api/share/state'); assert.equal(initial.body.enabled, false); assert.equal(initial.body.dailyLimit, null);
+  for (const body of [{ enabled: true, recipientId: friend }, { enabled: true, url: 'https://www.douyin.com/video/999' }, { dailyLimit: 3 }]) assert.equal((await f.request('/api/share/configure', body)).status, 400);
+  const configured = await f.request('/api/share/configure', { enabled: true, dailyLimit: 4 }); assert.equal(configured.status, 200); assert.equal(configured.body.dailyLimit, null); assert.equal(configured.body.recipients[0].id, friend);
   assert.equal((await f.request('/api/share/send', f.input)).status, 404); assert.equal((await f.request('/api/share/configure', { enabled: false })).status, 200);
   assert.equal(f.stats().browserCalls, 0); assert.equal(fs.readFileSync(f.videoLimits.sessionsFile, 'utf8'), sessions); assert.equal(f.shareService.state().daily.attempts, 0);
 });
@@ -50,11 +51,11 @@ test('HTTP保留未确认卡片的核对入口，核对不清空预算或自动�
   const f = await fixture(t, async (input, { authorize }) => { authorize({ phase: 'before-click', videoId: input.expectedVideoId, recipientId: input.recipientId }); return { confirmed: false, deliveryUncertain: true, operationId: 'synthetic-forward-uncertain' }; });
   await f.request('/api/share/configure', { enabled: true }); const sent = await f.shareService.share(f.input);
   const state = await f.request('/api/share/state'); assert.equal(state.status, 200); assert.equal(state.body.paused, true); assert.equal(state.body.needsReview[0].operationId, sent.operationId);
-  await f.request('/api/share/configure', { enabled: false }); assert.equal((await f.request('/api/share/configure', { enabled: true })).status, 409);
+  await f.request('/api/share/configure', { enabled: false }); assert.equal((await f.request('/api/share/configure', { enabled: true })).status, 200); assert.equal(f.shareService.state().enabled,false);
   assert.equal((await f.request('/api/share/resolve', { operationId: sent.operationId, outcome: 'reset-budget' })).status, 400);
   assert.equal((await f.request('/api/share/resolve', { operationId: sent.operationId, outcome: 'not-sent', enabled: true })).status, 400);
   const resolved = await f.request('/api/share/resolve', { operationId: sent.operationId, outcome: 'not-sent' }); assert.equal(resolved.status, 200); assert.equal(resolved.body.paused, false); assert.equal(resolved.body.enabled, false); assert.equal(resolved.body.daily.attempts, 1);
-  await f.request('/api/share/configure', { enabled: true }); await assert.rejects(f.shareService.share(f.input), /重复/); assert.equal(f.stats().browserCalls, 0);
+  await f.request('/api/share/configure', { enabled: true }); assert.equal((await f.shareService.share(f.input)).code, 'SHARE_ALREADY_PROCESSED'); assert.equal(f.stats().browserCalls, 0);
 });
 
 test('关闭软件HTTP服务会等待自己尚未发送的分享取消并释放共享锁', async t => {

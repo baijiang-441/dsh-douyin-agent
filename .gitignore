@@ -38,3 +38,9 @@ public/*-qa.png
 /verification/silent-local-*/
 /verification/token-benchmark-20*/
 /verification/release-*/
+/verification/issue-20261024/
+/verification/native-token-benchmark.mjs
+/verification/reload-native-token-fix.mjs
+/verification/token-benchmark-20261017.md
+/verification/token-benchmark-audit-20261017.md
+/verification/token-watch-metrics.mjs

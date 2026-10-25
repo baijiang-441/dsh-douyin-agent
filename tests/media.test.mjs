@@ -82,6 +82,22 @@ test('媒体合成测试：直接复用dsh-voice本地provider，auto语言与�
   const result=await adapter.transcribeAudio({source,backend:'local-whisper'});assert.equal(result.ok,true,JSON.stringify(result));assert.equal(request.body.get('language'),'auto');assert.equal(request.body.get('translate'),'false');assert.equal(request.body.get('response_format'),'json');
 });
 
+test('本地Whisper合法空对白返回no-speech，保留实际片段且不报告识别成功；HTTP响应为替身',async t=>{
+  const {source}=await fixture(t);
+  const adapter=await enabled(t,{config:{DOUYIN_MEDIA_WHISPER_URL:'http://127.0.0.1:8001/inference'},fetchImpl:async()=>response({text:'',segments:[],language:'zh',languageProbability:0.4})});
+  const result=await adapter.transcribeAudio({source,backend:'local-whisper',durationSeconds:0.5});
+  assert.equal(result.ok,false);assert.equal(result.status,'no-speech');assert.equal(result.backend,'local-whisper');assert.equal(result.kind,'transcription');assert.equal(result.text,'');assert.deepEqual(result.segments,[]);
+  assert.equal(result.interval.startSeconds,0);assert.equal(result.interval.durationSeconds,0.5);assert.equal(result.interval.durationVerifiedBy,'ffprobe-output');assert.equal(result.source.type,'local-file');assert.match(result.limitations[0],/无法据此确定是否静音/);
+});
+
+test('本地Whisper缺字段、损坏或错误的空返回仍failed，不能冒充no-speech；HTTP响应为替身',async t=>{
+  const {source}=await fixture(t);
+  for(const value of [{},{text:''},{text:'',segments:null},{text:'',segments:[{text:''}]},{text:'',segments:[],error:'合成后端错误'},{text:'',segments:[],ok:false},{text:'',segments:[],languageProbability:2},{text:42,segments:[]}]){
+    const adapter=await enabled(t,{config:{DOUYIN_MEDIA_WHISPER_URL:'http://127.0.0.1:8001/inference'},fetchImpl:async()=>response(value)});
+    const result=await adapter.transcribeAudio({source,durationSeconds:0.1});assert.equal(result.ok,false);assert.equal(result.status,'failed',JSON.stringify(value));
+  }
+});
+
 test('媒体合成测试：超预算、截断模型响应及预先停止均不报告成功',async t=>{
   const {source}=await fixture(t);const adapter=await enabled(t,{selectedBackend:'mimo',config:{XIAOMI_API_KEY:'synthetic-key'},fetchImpl:async()=>response({choices:[{finish_reason:'length',message:{content:'未完成'}}]})});
   assert.equal((await adapter.analyzeAudio({source,backend:'mimo',durationSeconds:121})).ok,false);assert.equal((await adapter.analyzeAudio({source,backend:'mimo'})).ok,false);

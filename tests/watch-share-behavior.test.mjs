@@ -22,8 +22,9 @@ function fixture(t, options = {}) {
   const personaMemory = new PersonaMemory({ memoryDir: path.join(root, 'memory'), legacyRoleCardFile: path.join(root, 'no-legacy.md'), clock: nowFn });
   const videoLimits = new VideoLimits({ stateDir, now: nowFn }); videoLimits.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: 10 }, { explicit: true });
   fs.writeFileSync(path.join(stateDir, 'chat-policy.json'), JSON.stringify({ allowlist: [{ id: recipientId, name: '合成好友甲', followed: true, isGroup: false, verifiedAt: '2026-10-15T01:00:00Z' }] }));
-  const current = () => { const value = state(id, time, options.duration || 10); value.video.paused = playbackPaused; return value; }, actions = [], requests = [], sends = [], delays = [], queue = options.decisions || [decision('stop')];
+  const current = () => { const value = state(id, time, options.duration || 10); value.video.paused = playbackPaused; return value; }, actions = [], requests = [], sends = [], delays = [], events = [], queue = options.decisions || [decision('stop')];
   let pauses = 0, watch;
+  const advancePlayback=ms=>{for(let remaining=ms;remaining>0;){const step=Math.min(1000,remaining);now+=step;time+=step/1000;videoLimits.notePlayback(source,current(),{ownerId:watch?.runId||source});remaining-=step;}};
   const controller = { execute: async (name, args, controls) => {
     controls.signal.throwIfAborted(); actions.push({ name, args, controls });
     if (name === 'douyin_observe') {
@@ -49,22 +50,22 @@ function fixture(t, options = {}) {
   const decisionProvider = async input => {
     requests.push(input); if (options.disableDuringModel) shareService.configure({ enabled: false }, { explicit: true });
     if (requests.length === 1) {
-      now += options.modelDelayMs ?? 0; time += (options.modelDelayMs ?? 0) / 1000;
+      if(options.liveAccounting)advancePlayback(options.modelDelayMs??0);else{now += options.modelDelayMs ?? 0; time += (options.modelDelayMs ?? 0) / 1000;}
       if (options.switchDuringModel) { id = String(BigInt(id) + 1n); time = 0; }
       if (options.pauseDuringModel) playbackPaused = true;
     }
     return { text: JSON.stringify(queue.shift() || decision('stop')), usage: { total_tokens: 1 } };
   };
-  watch = new AutonomousWatch({ controller, config: source === 'dsh' ? {} : { apiKey: 'synthetic-key' }, videoLimits, personaMemory, shareService, source, stateDir, now: nowFn, decisionProvider, delayImpl: async (ms, signal) => {
+  watch = new AutonomousWatch({ controller, config: source === 'dsh' ? {} : { apiKey: 'synthetic-key' }, videoLimits, personaMemory, shareService, source, stateDir, now: nowFn, decisionProvider, onEvent: event => events.push(event), delayImpl: async (ms, signal) => {
     delays.push(ms);
     signal.throwIfAborted(); if (options.cancelStay) { watch.cancel(); return; }
-    const elapsed = options.delayMs ?? ms; now += elapsed; time += options.stayProgress ?? elapsed / 1000;
+    const elapsed = options.delayMs ?? ms;if(options.liveAccounting)advancePlayback(elapsed);else{now += elapsed; time += options.stayProgress ?? elapsed / 1000;}
     if (options.switchDuringStay) { id = String(BigInt(id) + 1n); time = 0; }
     if (options.pauseDuringStay) playbackPaused = true;
   } });
   t.after(async () => { await watch.close(); await shareService.close(); assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep)); fs.rmSync(root, { recursive: true, force: true }); });
   const run = async () => { watch.start({ startSession: true, maxRequests: 5 }, { explicit: true }); return await watch.completion; };
-  return { root, stateDir, source, current, actions, requests, sends, delays, watch, shareService, personaMemory, videoLimits, run, pauses: () => pauses };
+  return { root, stateDir, source, current, actions, requests, sends, delays, events, watch, shareService, personaMemory, videoLimits, run, switchVideo: () => { id = String(BigInt(id) + 1n); time = 0; return current(); }, pauses: () => pauses };
 }
 
 test('分享模型协议只允许当前许可好友，不允许URL、作品编号、观察编号或正文', () => {
@@ -94,6 +95,26 @@ test('分享关闭、名单外、模型等待期间撤回许可时不进入发�
     const f = fixture(t, { ...options, decisions: [decision('share', { recipientId: options.target || recipientId })] }); const final = await f.run();
     assert.equal(final.status, 'failed'); assert.equal(f.sends.length, 0); assert.equal(f.shareService.state().daily.attempts, 0); assert.equal(f.personaMemory.snapshot().interests.length, 0);
   }
+});
+
+test('同片同人重复分享只跳过该动作，继续换片，不重复发送、扣次或学习分享', async t => {
+  for (const source of ['api', 'dsh']) {
+    const f = fixture(t, { source, sharing: true, decisions: [decision('share', { recipientId, reason: 'PRIVATE_LOCAL_SHARE_REASON' }), decision('share', { recipientId }), decision('skip'), decision('stop')] });
+    const result = await f.run(); assert.equal(result.status, 'stopped'); assert.equal(f.requests.length, 4); assert.equal(f.sends.length, 1); assert.equal(f.shareService.state().daily.attempts, 1); assert.equal(f.shareService.ledger().operations.length, 1);
+    assert.ok(f.actions.some(item => item.name === 'douyin_next')); assert.equal(f.personaMemory.snapshot().recentObservations.find(item => item.videoId === ID).actions.share, 1);
+    const skipped = f.events.filter(event => event.type === 'watch.share-skipped'); assert.equal(skipped.length, 1); assert.equal(skipped[0].code, 'SHARE_ALREADY_PROCESSED'); assert.equal(skipped[0].videoId, ID); assert.equal(skipped[0].recipientId, recipientId);
+    const prompt = f.requests[1].messages[1].content[0].text; assert.match(prompt, /当前作品分享去重摘要/); assert.ok(prompt.includes(JSON.stringify({ videoId: ID, processedRecipients: [{ recipientId, status: 'confirmed' }] }))); assert.doesNotMatch(prompt, /PRIVATE_LOCAL_SHARE_REASON/);
+    assert.doesNotMatch(f.requests[3].messages[1].content[0].text, /当前作品分享去重摘要/);
+  }
+});
+
+test('watch只接受精确匹配的typed去重结果，伪装skip、未知错误和不确定结果仍停止', async t => {
+  const good = { status: 'skipped', code: 'SHARE_ALREADY_PROCESSED', skipped: true, confirmed: false, deliveryUncertain: false, recipientId, videoId: ID, previousStatus: 'confirmed' };
+  for (const extra of [{ status: undefined }, { code: 'UNKNOWN_SKIP' }, { skipped: false }, { confirmed: true }, { deliveryUncertain: true }, { recipientId: `conv:${'c'.repeat(64)}` }, { videoId: '99999' }, { previousStatus: 'uncertain' }]) {
+    const f = fixture(t, { sharing: true, decisions: [decision('share', { recipientId }), decision('skip')] }); f.shareService.share = async () => ({ ...good, ...extra });
+    const result = await f.run(); assert.equal(result.status, 'needs_user'); assert.equal(f.requests.length, 1); assert.equal(f.sends.length, 0); assert.equal(f.events.some(event => event.type === 'watch.share-skipped'), false); assert.equal(f.personaMemory.snapshot().recentObservations[0].actions.share, 0); assert.equal(f.actions.some(item => item.name === 'douyin_next'), false);
+  }
+  const f = fixture(t, { sharing: true, decisions: [decision('share', { recipientId })] }); f.shareService.share = async () => { throw new Error('合成未知分享错误'); }; const result = await f.run(); assert.equal(result.status, 'failed'); assert.match(result.lastError, /合成未知分享错误/); assert.equal(f.events.some(event => event.type === 'watch.share-skipped'), false);
 });
 
 test('分享回执不确定会停止循环并保留暂停；发送故障不伪装成成功互动', async t => {
@@ -135,15 +156,82 @@ test('模型等待长于可信窗口后仍可换片，但不把漏记的长停�
   const records = JSON.parse(fs.readFileSync(short.personaMemory.stateFile)), waited = records.behavior.viewings.find(row => row.sampleId.includes(':model-wait:')); assert.equal(waited.wallSeconds, 2); assert.equal(waited.from.time, 3); assert.equal(waited.to.time, 5);
 });
 
-test('模型等待或停留期间换片与暂停均不学习，到视频截止仍立即结束', async t => {
-  for (const options of [{ switchDuringModel: true }, { pauseDuringModel: true }, { switchDuringStay: true }, { pauseDuringStay: true }]) {
+test('模型等待暂停或停留期间换片与暂停仍停止学习，到视频截止立即结束', async t => {
+  for (const options of [{ pauseDuringModel: true }, { switchDuringStay: true }, { pauseDuringStay: true }]) {
     const f = fixture(t, { ...options, modelDelayMs: 31000, duration: 100, decisions: [decision('stay', { seconds: 2 })] }); const result = await f.run();
     assert.equal(result.status, 'needs_user', JSON.stringify({ options, result })); assert.equal(f.personaMemory.snapshot().interests.length, 0); assert.equal(f.personaMemory.snapshot().recentObservations.find(row => row.videoId === ID).actions.stay, 0);
     if (options.switchDuringModel || options.pauseDuringModel) assert.equal(f.delays.length, 0);
   }
-  const expired = fixture(t, { modelDelayMs: 31000, delayMs: 27000, duration: 1000, decisions: [decision('stay', { seconds: 2 })] });
+  const expired = fixture(t, { liveAccounting:true,modelDelayMs: 31000, delayMs: 27000, duration: 1000, decisions: [decision('stay', { seconds: 2 })] });
   expired.videoLimits.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: 1 }, { explicit: true }); const result = await expired.run();
   assert.equal(result.status, 'limited', JSON.stringify(result)); assert.equal(expired.requests.length, 1); assert.equal(expired.videoLimits.state().allowed, false); assert.equal(expired.personaMemory.snapshot().interests.length, 0); assert.equal(expired.personaMemory.snapshot().recentObservations[0].actions.stay, 0);
+});
+
+test('模型等待A变B后丢弃所有非stop旧决策，只重新观察B，不学习或对B执行A动作', async t => {
+  for (const action of ['skip', 'stay', 'search', 'share', 'comment']) {
+    const selected = decision(action, action === 'share' ? { recipientId } : action === 'search' ? { query: '合成主题' } : action === 'stay' ? { seconds: 2 } : {});
+    const f = fixture(t, { sharing: true, switchDuringModel: true, duration: 100, decisions: [selected, decision('stop')] });
+    let comments = 0; f.watch.commentService = { context: () => ({ enabled: true, paused: false, remainingDaily: 1, remainingSession: 1 }), comment: async () => { comments++; assert.fail('旧作品评论不能作用到新作品'); } }; f.watch.commentAgent.generate = async () => { comments++; assert.fail('旧作品不应生成评论'); };
+    const result = await f.run(); assert.equal(result.status, 'stopped', action); assert.equal(result.lastError, ''); assert.equal(f.requests.length, 2); assert.equal(f.sends.length, 0); assert.equal(comments, 0); assert.deepEqual(f.delays, []);
+    assert.equal(f.actions.some(item => ['douyin_next', 'douyin_search', 'douyin_open_video'].includes(item.name)), false); assert.equal(f.actions.filter(item => item.name === 'douyin_observe').length, 2); assert.equal(f.personaMemory.snapshot().interests.length, 0);
+    const old = f.personaMemory.snapshot().recentObservations.find(item => item.videoId === ID); assert.deepEqual(old.actions, { stay: 0, skip: 0, share: 0 }); assert.ok(f.personaMemory.snapshot().recentObservations.some(item => item.videoId !== ID));
+    const dropped = f.events.filter(event => event.type === 'watch.decision-discarded'); assert.equal(dropped.length, 1); assert.equal(dropped[0].action, action); assert.equal(dropped[0].expectedVideoId, ID); assert.notEqual(dropped[0].currentVideoId, ID);
+  }
+});
+
+test('换片输入前A已变B的精确stale回执不产生第二次输入，重新观察B而不记A的skip', async t => {
+  const f = fixture(t, { decisions: [decision('skip'), decision('stop')] }), execute = f.watch.controller.execute; let skipChecks = 0;
+  f.watch.controller.execute = async (name, args, controls) => {
+    if (name !== 'douyin_next') return execute(name, args, controls);
+    skipChecks++; assert.equal(skipChecks, 1); assert.deepEqual(args, {}); assert.equal(controls.expectedVideoId, ID);
+    const state = f.switchVideo(); return { changed: false, staleObservation: true, reasonCode: 'observed-video-changed', expectedVideoId: ID, before: state.video, after: state.video, state };
+  };
+  const result = await f.run(); assert.equal(result.status, 'stopped'); assert.equal(f.requests.length, 2); assert.equal(skipChecks, 1); assert.equal(f.actions.filter(item => item.name === 'douyin_next').length, 0); assert.equal(f.actions.filter(item => item.name === 'douyin_observe').length, 2); assert.equal(f.personaMemory.snapshot().interests.length, 0); assert.equal(f.personaMemory.snapshot().recentObservations.find(item => item.videoId === ID).actions.skip, 0); assert.equal(f.events.filter(event => event.type === 'watch.decision-discarded').length, 1);
+});
+
+test('伪装或不完整stale回执、同片、暂停、未就绪和验证码都不能当成正常换片继续', async t => {
+  for (const mutation of ['changed', 'flag', 'reason', 'expected', 'same', 'paused', 'unready', 'missing', 'verification']) {
+    const f = fixture(t, { decisions: [decision('skip'), decision('stop')] }), execute = f.watch.controller.execute;
+    f.watch.controller.execute = async (name, args, controls) => {
+      if (name !== 'douyin_next') return execute(name, args, controls);
+      assert.equal(controls.expectedVideoId, ID); const state = mutation === 'same' ? f.current() : f.switchVideo(); const output = { changed: false, staleObservation: true, reasonCode: 'observed-video-changed', expectedVideoId: ID, state };
+      if (mutation === 'changed') output.changed = true; if (mutation === 'flag') output.staleObservation = false; if (mutation === 'reason') output.reasonCode = 'unknown-reason'; if (mutation === 'expected') output.expectedVideoId = '9999999999999'; if (mutation === 'paused') state.video.paused = true; if (mutation === 'unready') state.video.readyState = 1; if (mutation === 'missing') delete output.state; if (mutation === 'verification') state.verificationRequired = true;
+      return output;
+    };
+    const result = await f.run(); assert.equal(result.status, 'needs_user', mutation); assert.equal(f.requests.length, 1); assert.equal(f.personaMemory.snapshot().interests.length, 0); assert.equal(f.personaMemory.snapshot().recentObservations.find(item => item.videoId === ID).actions.skip, 0); assert.equal(f.events.some(event => event.type === 'watch.decision-discarded'), false);
+  }
+});
+
+test('模型等待已换片但新片暂停、验证或未就绪时仍停，不因重采样自动播放', async t => {
+  for (const mutation of ['paused', 'unready', 'verification']) {
+    const f = fixture(t, { switchDuringModel: true, decisions: [decision('stay', { seconds: 2 }), decision('stop')] }), execute = f.watch.controller.execute;
+    f.watch.controller.execute = async (name, ...args) => { const output = await execute(name, ...args); if (name === 'douyin_status' && f.requests.length) { if (mutation === 'paused') output.video.paused = true; if (mutation === 'unready') output.video.readyState = 1; if (mutation === 'verification') output.verificationRequired = true; } return output; };
+    const result = await f.run(); assert.equal(result.status, 'needs_user', mutation); assert.equal(f.requests.length, 1); assert.equal(f.actions.some(item => item.name === 'douyin_play'), false); assert.equal(f.personaMemory.snapshot().interests.length, 0);
+  }
+});
+
+test('模型后暂缺ID两次时只读等待，B就绪后丢旧动作重采样，不新模型或额外输入', async t => {
+  const f = fixture(t, { decisions: [decision('skip'), decision('stop')] }), execute = f.watch.controller.execute; let reads = 0;
+  f.watch.controller.execute = async (name, ...args) => {
+    const output = await execute(name, ...args);
+    if (name === 'douyin_status' && f.requests.length === 1) { reads++; if (reads <= 2) return { ...output, video: { ...output.video, id: null, readyState: 0 } }; if (reads === 3) return f.switchVideo(); }
+    return output;
+  };
+  const result = await f.run(); assert.equal(result.status, 'stopped'); assert.equal(result.lastError, ''); assert.equal(reads, 3); assert.deepEqual(f.delays, [250, 250]); assert.equal(f.requests.length, 2); assert.equal(f.actions.some(item => item.name === 'douyin_next'), false); assert.equal(f.actions.filter(item => item.name === 'douyin_observe').length, 2); assert.equal(f.personaMemory.snapshot().recentObservations.find(item => item.videoId === ID).actions.skip, 0); assert.equal(f.personaMemory.snapshot().interests.length, 0);
+});
+
+test('模型后未知作品持续不就绪时最多四秒只读等待，不盲重试输入或新模型', async t => {
+  const f = fixture(t, { decisions: [decision('skip')] }), execute = f.watch.controller.execute;
+  f.watch.controller.execute = async (name, ...args) => { const output = await execute(name, ...args); return name === 'douyin_status' && f.requests.length ? { ...output, video: { ...output.video, id: null, readyState: 0 } } : output; };
+  const result = await f.run(); assert.equal(result.status, 'needs_user'); assert.match(result.lastError, /仍未稳定/); assert.equal(f.delays.length, 16); assert.equal(f.delays.reduce((sum, ms) => sum + ms, 0), 4000); assert.equal(f.requests.length, 1); assert.equal(f.actions.some(item => item.name === 'douyin_next'), false); assert.equal(f.personaMemory.snapshot().interests.length, 0);
+});
+
+test('暂缺ID但明确暂停、验证码、离站或私信遮挡时立即停止，不进入过渡帧等待', async t => {
+  for (const mutation of ['paused', 'verification', 'offsite', 'private']) {
+    const f = fixture(t, { decisions: [decision('skip')] }), execute = f.watch.controller.execute;
+    f.watch.controller.execute = async (name, ...args) => { const output = await execute(name, ...args); if (name === 'douyin_status' && f.requests.length) { output.video.id = null; output.video.readyState = 0; if (mutation === 'paused') output.video.paused = true; if (mutation === 'verification') output.verificationRequired = true; if (mutation === 'offsite') output.url = 'https://example.invalid/'; if (mutation === 'private') output.privateChatVisible = true; } return output; };
+    const result = await f.run(); assert.equal(result.status, 'needs_user', mutation); assert.deepEqual(f.delays, []); assert.equal(f.requests.length, 1); assert.equal(f.actions.some(item => item.name === 'douyin_next'), false);
+  }
 });
 
 test('失败换片、停留中换片或取消、拖动进度与卡住均不能学成喜欢', async t => {

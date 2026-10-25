@@ -9,8 +9,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { AutonomousShare } from '../autonomous-share.mjs';
 import { PersonaMemory } from '../persona-memory.mjs';
 import { VideoLimits } from '../video-limits.mjs';
+import { acquireFriendInteractionDispatch, readFriendInteractionsEnabled } from '../friend-interactions-guard.mjs';
+import { createHash } from 'node:crypto';
 
-const friend = `conv:${'a'.repeat(64)}`, other = `conv:${'b'.repeat(64)}`;
+const hash = value => createHash('sha256').update(value).digest('hex');
+const nativeFriend = 'synthetic-person-1', nativeOther = 'synthetic-person-2';
+const stableContact = nativeId => ({ id: `conv:${hash(`native:${nativeId}`)}`, nativeId, isGroup: false, identityVersion: 2, identityVerified: true, identityKind: 'native-conversation', identityHash: hash(`native:${nativeId}`), identityBinding: `binding:${hash(`direct\0native:${nativeId}`)}` });
+const friend = stableContact(nativeFriend).id, other = stableContact(nativeOther).id;
 const stateFor = (videoId = '12345') => ({ url: `https://www.douyin.com/video/${videoId}`, loginRequired: false, verificationRequired: false, privateChatVisible: false, video: { id: videoId, url: `https://www.douyin.com/video/${videoId}`, title: '合成作品', author: '合成作者', time: 3, duration: 60, paused: false, readyState: 4 } });
 const receipt = videoId => ({ confirmed: true, deliveryUncertain: false, deliveryType: 'native-card', videoId, operationId: 'synthetic-forward-receipt', messageId: 'synthetic-card-message' });
 
@@ -21,7 +26,7 @@ function fixture(t, options = {}) {
   const personaMemory = new PersonaMemory({ memoryDir: path.join(root, 'memory'), legacyRoleCardFile: path.join(root, 'absent-role.md'), clock }); personaMemory.initialize();
   const videoLimits = new VideoLimits({ stateDir, now: clock });
   videoLimits.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: 60 }, { explicit: true }); videoLimits.markSession('api', { explicit: true });
-  const contacts = [friend, other].map((id, index) => ({ id, name: `合成好友${index + 1}`, followed: true, isGroup: false, verifiedAt: '2026-10-15T01:00:00Z' }));
+  const contacts = [nativeFriend, nativeOther].map((nativeId, index) => ({ ...stableContact(nativeId), name: `合成好友${index + 1}`, followed: true, verifiedAt: '2026-10-15T01:00:00Z' }));
   fs.writeFileSync(path.join(stateDir, 'chat-policy.json'), JSON.stringify({ version: 1, enabled: false, allowlist: contacts }));
   const calls = [];
   const send = options.send || (async (input, controls) => { calls.push({ input, controls }); assert.deepEqual(Object.keys(input).sort(), ['expectedVideoId', 'recipientId']); controls.authorize({ phase: 'prepare', recipientId: input.recipientId, videoId: input.expectedVideoId }); controls.authorize({ phase: 'before-click', recipientId: input.recipientId, videoId: input.expectedVideoId }); return receipt(input.expectedVideoId); });
@@ -31,15 +36,15 @@ function fixture(t, options = {}) {
   return { root, stateDir, personaMemory, videoLimits, service, evidence, calls, contacts, clock, setNow: value => { now = value; } };
 }
 
-test('自主分享默认关闭，模型不能改策略，只显示已验证的两位好友', async t => {
+test('自主分享默认关闭，模型不能改策略，只显示当前已核对的许可会话', async t => {
   const f = fixture(t), input = f.evidence();
-  assert.equal(f.service.state().enabled, false); assert.equal(f.service.state().dailyLimit, 3);
+  assert.equal(f.service.state().enabled, false); assert.equal(f.service.state().dailyLimit, null);assert.equal(f.service.state().daily.remaining,null);
   assert.equal(f.service.context().enabled, false); assert.equal(f.service.context().recipients.length, 2);
   assert.throws(() => f.service.configure({ enabled: true }), /用户/);
-  for (const body of [{ enabled: true, dailyLimit: 0 }, { enabled: true, dailyLimit: 21 }, { enabled: true, recipientId: friend }, { enabled: 'true' }]) assert.throws(() => f.service.configure(body, { explicit: true }));
+  for (const body of [{ enabled: true, recipientId: friend }, { enabled: 'true' }]) assert.throws(() => f.service.configure(body, { explicit: true }));
   await assert.rejects(f.service.share(input), /尚未启用/); assert.equal(f.calls.length, 0);
   f.service.configure({ enabled: true }, { explicit: true });
-  assert.deepEqual(f.service.context().recipients, f.contacts.map(({ id, name }) => ({ id, name })));
+  assert.deepEqual(f.service.context().recipients, f.contacts.map(({ id, name, isGroup }) => ({ id, name, isGroup })));
   assert.equal(fs.existsSync(path.join(f.stateDir, 'share-ledger.json')), false);
 });
 
@@ -47,22 +52,85 @@ test('观察证据、同一作品及现有白名单是发送前提，不接受�
   const f = fixture(t), input = f.evidence(); f.service.configure({ enabled: true }, { explicit: true });
   for (const changed of [{ ...input, videoId: '999' }, { ...input, evidenceId: `video:${'0'.repeat(64)}` }, { ...input, recipientId: `conv:${'c'.repeat(64)}` }, { ...input, url: 'https://www.douyin.com/video/999' }, { ...input, text: '不能附带正文' }]) await assert.rejects(f.service.share(changed));
   assert.equal(f.calls.length, 0); assert.equal(f.service.state().daily.attempts, 0);
-  const record = JSON.parse(fs.readFileSync(path.join(f.stateDir, 'chat-policy.json'))); record.allowlist.push({ ...record.allowlist[0], id: `conv:${'d'.repeat(64)}` }); fs.writeFileSync(path.join(f.stateDir, 'chat-policy.json'), JSON.stringify(record));
-  await assert.rejects(f.service.share(input), /两位|白名单/); assert.equal(f.calls.length, 0);
+  const record = JSON.parse(fs.readFileSync(path.join(f.stateDir, 'chat-policy.json'))); record.allowlist.push({ ...record.allowlist[0] }); fs.writeFileSync(path.join(f.stateDir, 'chat-policy.json'), JSON.stringify(record));
+  await assert.rejects(f.service.share(input), /许可名单/); assert.equal(f.calls.length, 0);
 });
 
-test('启用后无需逐次确认即可发送作品卡片，跨入口持久预算并按好友与作品去重', async t => {
+test('启用后无需逐次确认即可发送作品卡片，跨入口持续计数并按好友与作品去重', async t => {
   const f = fixture(t), input = f.evidence(); f.service.configure({ enabled: true, dailyLimit: 2 }, { explicit: true });
   const sessionsBefore = fs.readFileSync(f.videoLimits.sessionsFile, 'utf8');
   const sent = await f.service.share(input); assert.equal(sent.confirmed, true); assert.equal(sent.messageId, 'synthetic-card-message'); assert.ok(sent.operationId); assert.equal(f.calls[0].controls.humanAuthorized, undefined);
   assert.equal(JSON.stringify(f.calls[0].input).includes(input.reason), false);
-  await assert.rejects(f.service.share(input), /重复/); assert.equal(f.calls.length, 1);
+  const beforeDuplicate = fs.readFileSync(f.service.files.ledger, 'utf8'); const skipped = await f.service.share(input); assert.equal(skipped.code, 'SHARE_ALREADY_PROCESSED'); assert.equal(skipped.skipped, true); assert.equal(skipped.confirmed, false); assert.equal(skipped.deliveryUncertain, false); assert.equal(skipped.operationId, undefined); assert.equal(fs.readFileSync(f.service.files.ledger, 'utf8'), beforeDuplicate); assert.equal(f.calls.length, 1);
   const second = new AutonomousShare({ personaMemory: f.personaMemory, videoLimits: f.videoLimits, send: async () => { throw new Error('不应进入第三次发送'); }, stateDir: f.stateDir, now: f.clock });
   assert.equal(second.state().daily.attempts, 1); await second.close();
-  await f.service.share({ ...input, recipientId: other }); assert.equal(f.service.state().daily.remaining, 0);
-  await assert.rejects(f.service.share(f.evidence('67890')), /上限/); assert.equal(f.calls.length, 2);
-  f.service.configure({ enabled: false }, { explicit: true }); f.service.configure({ enabled: true }, { explicit: true }); assert.equal(f.service.state().daily.attempts, 2);
+  await f.service.share({ ...input, recipientId: other }); assert.equal(f.service.state().daily.remaining, null);
+  assert.equal((await f.service.share(f.evidence('67890'))).confirmed,true); assert.equal(f.calls.length, 3);
+  f.service.configure({ enabled: false }, { explicit: true }); f.service.configure({ enabled: true }, { explicit: true }); assert.equal(f.service.state().daily.attempts, 3);
   assert.equal(fs.readFileSync(f.videoLimits.sessionsFile, 'utf8'), sessionsBefore);
+});
+
+test('旧分享上限读取即归一无限，超过20次仍核对许可、观察证据和一次发送',async t=>{
+  const f=fixture(t);fs.writeFileSync(f.service.files.policy,JSON.stringify({version:1,enabled:true,dailyLimit:3}));
+  assert.equal(f.service.policy().dailyLimit,null);assert.equal(f.service.context().dailyRemaining,null);assert.equal(f.service.context().enabled,true);
+  for(let i=0;i<25;i++)assert.equal((await f.service.share(f.evidence(String(30000+i)))).confirmed,true);
+  assert.equal(f.calls.length,25);assert.equal(f.service.state().daily.attempts,25);assert.equal(f.service.state().daily.limit,null);assert.equal(f.service.state().daily.remaining,null);
+  f.service.configure({enabled:false,dailyLimit:0},{explicit:true});f.service.configure({enabled:true,dailyLimit:1},{explicit:true});assert.equal(f.service.state().daily.attempts,25);
+  assert.equal((await f.service.share(f.evidence('40000'))).confirmed,true);assert.equal(f.calls.length,26);
+  assert.equal((await f.service.share(f.evidence('40000'))).code,'SHARE_ALREADY_PROCESSED');assert.equal(f.calls.length,26);
+});
+
+test('只有确定终态的同片同人处理记录返回typed跳过，账本、次数和发送均不改变', async t => {
+  for (const status of ['confirmed', 'not-sent', 'resolved-confirmed', 'resolved-not-sent']) {
+    const f = fixture(t), input = f.evidence(); f.service.configure({ enabled: true }, { explicit: true }); await f.service.share(input);
+    const ledger = f.service.ledger(); ledger.operations[0].status = status; fs.writeFileSync(f.service.files.ledger, JSON.stringify(ledger)); const before = fs.readFileSync(f.service.files.ledger, 'utf8');
+    const result = await f.service.share(input); assert.deepEqual({ status: result.status, code: result.code, skipped: result.skipped, confirmed: result.confirmed, deliveryUncertain: result.deliveryUncertain, videoId: result.videoId, recipientId: result.recipientId, previousStatus: result.previousStatus }, { status: 'skipped', code: 'SHARE_ALREADY_PROCESSED', skipped: true, confirmed: false, deliveryUncertain: false, videoId: input.videoId, recipientId: input.recipientId, previousStatus: status });
+    assert.equal(result.operationId, undefined); assert.equal(result.messageId, undefined); assert.equal(fs.readFileSync(f.service.files.ledger, 'utf8'), before); assert.equal(f.service.state().daily.attempts, 1); assert.equal(f.calls.length, 1); assert.equal(f.service.state().busy, false);
+  }
+});
+
+test('已处理作品仍先核对许可、证据、时段及未知收据，失败不能伪装成正常去重', async t => {
+  for (const mutation of ['disabled', 'master-off', 'allowlist', 'evidence', 'ended', 'unresolved']) {
+    const f = fixture(t), input = f.evidence(); f.service.configure({ enabled: true }, { explicit: true }); await f.service.share(input);
+    if (mutation === 'disabled') f.service.configure({ enabled: false }, { explicit: true });
+    if (mutation === 'master-off') fs.writeFileSync(path.join(f.stateDir, 'friend-interactions-policy.json'), JSON.stringify({ version: 1, enabled: false }));
+    if (mutation === 'allowlist') fs.writeFileSync(path.join(f.stateDir, 'chat-policy.json'), JSON.stringify({ version: 1, allowlist: [] }));
+    if (mutation === 'evidence') f.personaMemory.snapshot = () => ({ recentObservations: [] });
+    if (mutation === 'ended') f.videoLimits.endSession({ explicit: true });
+    if (mutation === 'unresolved') { const ledger = f.service.ledger(); ledger.operations.push({ ...ledger.operations[0], operationId: 'synthetic-unresolved-other', videoId: '67890', status: 'uncertain' }); ledger.days[ledger.operations[0].day]++; fs.writeFileSync(f.service.files.ledger, JSON.stringify(ledger)); }
+    const before = fs.readFileSync(f.service.files.ledger, 'utf8'); await assert.rejects(f.service.share(input)); assert.equal(fs.readFileSync(f.service.files.ledger, 'utf8'), before); assert.equal(f.calls.length, 1);
+  }
+  for (const status of ['reserved', 'clicking', 'uncertain']) {
+    const f = fixture(t), input = f.evidence(); f.service.configure({ enabled: true }, { explicit: true }); await f.service.share(input); const ledger = f.service.ledger(); ledger.operations[0].status = status; fs.writeFileSync(f.service.files.ledger, JSON.stringify(ledger));
+    await assert.rejects(f.service.share(input), /未确认/); assert.equal(f.calls.length, 1); assert.equal(f.service.state().paused, true);
+  }
+});
+
+test('模型去重摘要仅包含当前作品且仍获许可的收件人终态，不带理由或历史正文', async t => {
+  const f = fixture(t), input = f.evidence(); f.service.configure({ enabled: true }, { explicit: true }); await f.service.share(input); await f.service.share({ ...input, recipientId: other }); await f.service.share(f.evidence('67890'));
+  const ledger = f.service.ledger(); ledger.operations[0].reason = 'PRIVATE_LOCAL_REASON'; ledger.operations[0].messageId = 'PRIVATE_OLD_MESSAGE'; fs.writeFileSync(f.service.files.ledger, JSON.stringify(ledger));
+  fs.writeFileSync(path.join(f.stateDir, 'chat-policy.json'), JSON.stringify({ version: 1, allowlist: [f.contacts[0]] }));
+  const context = f.service.context({ videoId: input.videoId }); assert.deepEqual(context.processedRecipients, [{ recipientId: friend, status: 'confirmed' }]); assert.equal(context.recipients.length, 1); assert.doesNotMatch(JSON.stringify(context), /PRIVATE_LOCAL_REASON|PRIVATE_OLD_MESSAGE|67890/); assert.deepEqual(f.service.context().processedRecipients, []);
+});
+
+test('分享支持超过50个已核对会话，不放宽重复或失去身份的名单',async t=>{
+  const f=fixture(t),allowlist=Array.from({length:251},(_,i)=>({id:`conv:${String(i).padStart(64,'0')}`,name:`合成更多许可会话${i}`,followed:true,isGroup:false,verifiedAt:'2026-10-15T01:00:00Z'}));
+  fs.writeFileSync(path.join(f.stateDir,'chat-policy.json'),JSON.stringify({version:1,allowlist}));assert.equal(f.service.recipients().length,251);f.service.configure({enabled:true},{explicit:true});assert.equal(f.service.context().recipients.length,251);
+  allowlist[250].followed=false;fs.writeFileSync(path.join(f.stateDir,'chat-policy.json'),JSON.stringify({version:1,allowlist}));assert.throws(()=>f.service.recipients(),/许可名单/);
+});
+
+test('好友互动总开关关闭或损坏时分享拒绝，即使旧分享开关仍开启',async t=>{
+  const f=fixture(t);f.service.configure({enabled:true},{explicit:true});const file=path.join(f.stateDir,'friend-interactions-policy.json');
+  fs.writeFileSync(file,JSON.stringify({version:1,enabled:false}));assert.equal(f.service.context().enabled,false);await assert.rejects(f.service.share(f.evidence()),/总开关/);assert.equal(f.calls.length,0);
+  fs.writeFileSync(file,'损坏的总开关');await assert.rejects(f.service.share(f.evidence()),/总开关记录损坏/);assert.equal(f.calls.length,0);
+});
+
+test('分享最终短输入与总开关共用控制锁，持锁期间其他入口不能报关闭成功',async t=>{
+  let f;f=fixture(t,{send:async(input,{authorize})=>{
+    authorize({phase:'before-click',recipientId:input.recipientId,videoId:input.expectedVideoId});const release=authorize.beginDispatch();
+    try{assert.throws(()=>acquireFriendInteractionDispatch(f.stateDir),error=>error.code==='FRIEND_INTERACTIONS_BUSY');assert.equal(readFriendInteractionsEnabled(f.stateDir),true);}finally{release();}
+    return receipt(input.expectedVideoId);
+  }});f.service.configure({enabled:true},{explicit:true});assert.equal((await f.service.share(f.evidence())).confirmed,true);assert.equal(fs.existsSync(path.join(f.stateDir,'friend-interactions-control.guard')),false);
 });
 
 test('发送前重新读取开关、时限、白名单和证据，取消时不点击', async t => {
@@ -77,7 +145,7 @@ test('发送前重新读取开关、时限、白名单和证据，取消时不�
       controls.authorize({ phase: 'before-click', recipientId: input.recipientId, videoId: input.expectedVideoId });
       assert.fail('核验失败后不得点击');
     } });
-    f.service.configure({ enabled: true }, { explicit: true }); await assert.rejects(f.service.share(f.evidence()));
+    f.videoLimits.savePolicy({windows:['12:00-13:00']},{explicit:true});f.service.configure({ enabled: true }, { explicit: true }); await assert.rejects(f.service.share(f.evidence()));
     assert.equal(f.service.ledger().operations[0].status, 'not-sent'); assert.equal(f.service.state().busy, false);
   }
 });
@@ -92,7 +160,7 @@ test('未确认结果跨重启保持暂停；人工核对只解除暂停，不�
   restarted.configure({ enabled: false }, { explicit: true }); assert.throws(() => restarted.configure({ enabled: true }, { explicit: true }), /核对/);
   assert.throws(() => restarted.resolve({ operationId: result.operationId, outcome: 'not-sent' }), /用户/);
   restarted.resolve({ operationId: result.operationId, outcome: 'not-sent' }, { explicit: true }); assert.equal(restarted.state().paused, false); assert.equal(restarted.state().daily.attempts, 1);
-  restarted.configure({ enabled: true }, { explicit: true }); await assert.rejects(restarted.share(input), /重复/); await restarted.close();
+  restarted.configure({ enabled: true }, { explicit: true }); assert.equal((await restarted.share(input)).code, 'SHARE_ALREADY_PROCESSED'); await restarted.close();
 });
 
 test('自主观看运行编号和有限轮次必须一致，停止请求禁止发送', async t => {
@@ -108,8 +176,8 @@ test('自主观看运行编号和有限轮次必须一致，停止请求禁止�
 test('上海日期更新只重置新日计数，旧日同片同人去重和不确定暂停保留', async t => {
   const f = fixture(t), input = f.evidence(); f.service.configure({ enabled: true, dailyLimit: 1 }, { explicit: true });
   f.setNow(Date.parse('2026-10-15T15:59:00Z')); f.videoLimits.markSession('api', { explicit: true }); await f.service.share(input); assert.equal(f.service.state().daily.date, '2026-10-15');
-  f.setNow(Date.parse('2026-10-15T16:01:00Z')); assert.equal(f.service.state().daily.date, '2026-10-16'); assert.equal(f.service.state().daily.remaining, 1);
-  await assert.rejects(f.service.share(input), /重复/); await f.service.share(f.evidence('67890')); assert.equal(f.service.state().daily.attempts, 1);
+  f.setNow(Date.parse('2026-10-15T16:01:00Z')); assert.equal(f.service.state().daily.date, '2026-10-16'); assert.equal(f.service.state().daily.remaining, null);
+  assert.equal((await f.service.share(input)).code, 'SHARE_ALREADY_PROCESSED'); await f.service.share(f.evidence('67890')); assert.equal(f.service.state().daily.attempts, 1);
 });
 
 test('没有官方卡片或可信点击检查时不宣称成功，不向联系人发送解释或链接', async t => {
@@ -142,18 +210,63 @@ test('异常退出遗留预留收据会暂停，损坏账本和发送锁不会�
   fs.writeFileSync(f.service.files.ledger, '{broken'); await assert.rejects(f.service.share(f.evidence('67890')), /记录/); assert.equal(fs.readFileSync(f.service.files.ledger, 'utf8'), '{broken');
 });
 
+test('只有存活发送锁精确绑定的预留和点击记录显示进行中，不误报需要人工核对', async t => {
+  const entered = Promise.withResolvers(), proceed = Promise.withResolvers(); let f;
+  f = fixture(t, { send: async (input, { authorize }) => {
+    authorize({ phase: 'prepare', recipientId: input.recipientId, videoId: input.expectedVideoId }); entered.resolve(); await proceed.promise;
+    authorize({ phase: 'before-click', recipientId: input.recipientId, videoId: input.expectedVideoId });
+    const clicking = f.service.state(); assert.equal(clicking.activity.status, 'sending'); assert.equal(clicking.activity.phase, 'clicking'); assert.equal(clicking.inProgress, true); assert.equal(clicking.paused, false);
+    return receipt(input.expectedVideoId);
+  } });
+  f.service.configure({ enabled: true }, { explicit: true }); const pending = f.service.share(f.evidence());
+  await entered.promise;
+  try {
+    const state = f.service.state(), owner = JSON.parse(fs.readFileSync(f.service.files.send));
+    assert.equal(owner.operationId, state.activity.operationId); assert.equal(owner.pid, process.pid);
+    assert.equal(state.activity.status, 'sending'); assert.equal(state.activity.phase, 'reserved'); assert.equal(state.inProgress, true); assert.equal(state.paused, false); assert.deepEqual(state.needsReview, []);
+    assert.equal(f.service.context().enabled, false); await assert.rejects(f.service.share(f.evidence('67890')), /未确认|正在处理/);
+  } finally { proceed.resolve(); }
+  assert.equal((await pending).confirmed, true); assert.deepEqual(f.service.state().activity, { status: 'idle' }); assert.equal(f.service.state().inProgress, false);
+});
+
+test('同进程旧预留、错误或缺失operationId、死亡发送锁和uncertain记录始终保留人工核对', async t => {
+  for (const mode of ['other-operation', 'other-pid', 'missing-operation', 'missing-guard', 'dead', 'uncertain']) {
+    const f = fixture(t), input = f.evidence(); f.service.configure({ enabled: true }, { explicit: true });
+    const operation = { operationId: 'synthetic-guarded-operation', ...input, source: 'api', pid: mode === 'other-pid' ? 2147483647 : process.pid, status: mode === 'uncertain' ? 'uncertain' : 'reserved', day: '2026-10-15' };
+    fs.writeFileSync(f.service.files.ledger, JSON.stringify({ version: 1, days: { '2026-10-15': 1 }, operations: [operation] }));
+    if (mode !== 'missing-guard') fs.writeFileSync(f.service.files.send, JSON.stringify({ pid: mode === 'dead' ? 2147483647 : process.pid, token: 'synthetic-owner', ...(mode === 'missing-operation' ? {} : { operationId: mode === 'other-operation' ? 'different-operation' : operation.operationId }) }));
+    const state = f.service.state(); assert.equal(state.inProgress, false, mode); assert.equal(state.paused, true, mode); assert.equal(state.needsReview.length, 1, mode); assert.deepEqual(state.activity, { status: 'needs-review' }, mode); assert.equal(f.service.context().enabled, false, mode);
+    await assert.rejects(f.service.share(input), /未确认/, mode);
+  }
+});
+
+test('具体未发送原因贯穿转发收据和自主分享看板，未确认不被当作跳过', async t => {
+  for (const clicked of [false, true]) {
+    const f = fixture(t, { send: async (input, { authorize }) => {
+      if (clicked) authorize({ phase: 'before-click', recipientId: input.recipientId, videoId: input.expectedVideoId });
+      return { confirmed: false, deliveryUncertain: clicked, operationId: 'synthetic-forward-specific', failure: { code: clicked ? 'FORWARD_RECEIPT_UNCONFIRMED' : 'FORWARD_RECIPIENT_IDENTITY_MISMATCH', stage: clicked ? 'receipt' : 'recipient', message: '合成失败原因 token=private-token MS4PrivateAccount https://private.invalid' } };
+    } });
+    f.service.configure({ enabled: true }, { explicit: true }); const result = await f.service.share(f.evidence());
+    assert.equal(result.confirmed, false); assert.equal(result.deliveryUncertain, clicked); assert.equal(result.skipped, undefined);
+    const state = f.service.state(), record = state.recent.at(-1); assert.equal(record.status, clicked ? 'uncertain' : 'not-sent'); assert.equal(record.forwardOperationId, 'synthetic-forward-specific'); assert.equal(record.failure.stage, clicked ? 'receipt' : 'recipient'); assert.equal(record.failure.code, result.failure.code);
+    assert.equal(record.failure.message.includes('private-token'), false); assert.equal(record.failure.message.includes('MS4PrivateAccount'), false); assert.equal(record.failure.message.includes('private.invalid'), false);
+    if (clicked) { assert.equal(state.needsReview.length, 1); await assert.rejects(f.service.share(f.evidence('67890')), /未确认/); }
+  }
+});
+
 test('真实合成分享面板通过可信授权发送官方卡片，撤回授权与JSON伪造不能点击', { timeout: 15000 }, async t => {
   const [{ chromium }, { VideoForwarder }, { readPageState }] = await Promise.all([import('../playwright-runtime.mjs'), import('../video-forward.mjs'), import('../core.mjs?v=9')]);
   const browser = await chromium.launch({ channel: 'msedge', headless: true }); t.after(() => browser.close());
   for (const revoked of [true, false]) {
     const f = fixture(t), page = await browser.newPage();
-    await page.route('**/*', route => route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"/>' }));
-    await page.setContent('<div data-e2e="video-share-icon-container" style="width:300px;height:100px">分享<div data-e2e="video-share-container"><div data-e2e="share-friend-row"><img src="https://synthetic.invalid/aweme-avatar/friend.png" width="24" height="24"><span data-e2e="share-friend-name">合成好友1</span><button data-e2e="share-friend-send">分享</button></div></div></div>');
-    await page.evaluate(() => { window.sendCount = 0; document.querySelector('button').addEventListener('click', () => { window.sendCount++; }); });
+    await page.route('**/*', route => route.fulfill(route.request().resourceType() === 'document' ? { contentType: 'text/html', body: '<!doctype html><html><body></body></html>' } : { contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"/>' }));
+    await page.goto('https://www.douyin.com/video/12345');
+    await page.setContent('<div data-e2e="video-share-icon-container" style="width:300px;height:100px">分享<div data-e2e="video-share-container"><div data-e2e="share-friend-row" data-conversation-type="direct" data-conversation-id="synthetic-person-1"><img src="https://synthetic.invalid/aweme-avatar/friend.png" width="24" height="24"><span data-e2e="share-friend-name">合成好友1</span><button data-e2e="share-friend-send">分享</button></div></div></div>');
+    await page.evaluate(() => { document.body.insertAdjacentHTML('beforeend', '<section data-e2e="feed-active-video" class="video_12345"><video style="position:fixed;left:700px;top:10px;width:80px;height:50px"></video></section>'); Object.defineProperty(document.querySelector('video'), 'readyState', { value: 4 }); window.sendCount = 0; document.querySelector('button').addEventListener('click', () => { window.sendCount++; }); });
     const realEvaluate = page.evaluate.bind(page); page.evaluate = (fn, arg) => fn === readPageState ? Promise.resolve(stateFor()) : realEvaluate(fn, arg);
     let gates = 0, verified = 0;
     const controller = { source: 'api', withPage: async (action, options) => { assert.equal(options.autonomousRunId, undefined); return action(page); }, pauseForLimits: async () => {}, settle: async () => { throw new Error('自主分享不能导航另一作品'); } };
-    const contact = { id: friend, name: '合成好友1', displayName: '合成好友1', avatar: 'https://synthetic.invalid/aweme-avatar/friend.png', followed: true, isGroup: false };
+    const contact = { ...f.contacts[0], displayName: '合成好友1', avatar: 'https://synthetic.invalid/aweme-avatar/friend.png' };
     const chatBrowser = { contacts: new Map([[friend, contact]]), listContacts: async ({ verifyFollowing }) => { assert.equal(verifyFollowing, true); verified++; return { contacts: [contact] }; }, readConversation: async () => ({ conversation: { id: friend }, messages: await realEvaluate(() => window.sendCount) ? [{ id: 'synthetic-real-dom-card', sender: 'outgoing', arrivalClassification: 'new-tail', media: { type: 'shared-work', videoId: '12345' } }] : [] }), sendMessage: async () => { throw new Error('不能发送正文或链接'); } };
     const forwarder = new VideoForwarder({ controller, chatBrowser, stateDir: f.stateDir, videoLimits: { beforeAction: () => { gates++; if (revoked && gates === 4) f.service.configure({ enabled: false }, { explicit: true }); return { allowed: true }; } } });
     const forged = await forwarder.forwardAutonomous({ recipientId: friend, expectedVideoId: '12345' }, { authorize: true }); assert.equal(forged.confirmed, false); assert.equal(verified, 0);
@@ -165,16 +278,17 @@ test('真实合成分享面板通过可信授权发送官方卡片，撤回授�
   }
 });
 
-test('真实临时 Edge：1200ms 按钮等待中跨入口关闭、换作品或换好友均不产生点击', { timeout: 30000 }, async t => {
+test('真实临时 Edge：几何等待和最终核验期间跨入口关闭、换作品或换好友均不点击', { timeout: 30000 }, async t => {
   const [{ chromium }, { VideoForwarder }] = await Promise.all([import('../playwright-runtime.mjs'), import('../video-forward.mjs')]);
-  for (const mutation of ['disabled', 'video', 'recipient']) {
+  for (const stage of ['geometry-wait', 'before-click']) for (const mutation of ['disabled', 'video', 'recipient']) {
     const f = fixture(t), profile = path.join(f.root, 'isolated-edge-profile');
-    let owner, client, timer;
+    const entered = Promise.withResolvers(), release = Promise.withResolvers(), disconnected = Promise.withResolvers();
+    let owner, client, latched = false;
     try {
       owner = await chromium.launchPersistentContext(profile, { channel: 'msedge', headless: true, args: ['--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1'] });
       await owner.route('**/*', route => route.fulfill(route.request().resourceType() === 'document' ? { contentType: 'text/html; charset=utf-8', body: `<!doctype html><html><body>
         <section data-e2e="feed-active-video"><div data-e2e="player-container" class="video_12345"><video muted autoplay style="width:240px;height:320px"></video></div><span data-e2e="video-desc">合成测试作品</span></section>
-        <div data-e2e="video-share-icon-container" style="position:fixed;left:300px;top:30px;width:500px;height:250px"><span class="s7K4YLGp" style="display:block;width:50px;height:40px">分享</span><div data-e2e="video-share-container"><div data-e2e="share-friend-row"><img src="https://synthetic.invalid/aweme-avatar/friend.png" width="24" height="24"><span data-e2e="share-friend-name">合成好友1</span><button data-e2e="share-friend-send">分享</button></div></div></div>
+        <div data-e2e="video-share-icon-container" style="position:fixed;left:300px;top:30px;width:500px;height:250px"><span class="s7K4YLGp" style="display:block;width:50px;height:40px">分享</span><div data-e2e="video-share-container"><div data-e2e="share-friend-row" data-conversation-type="direct" data-conversation-id="synthetic-person-1"><img src="https://synthetic.invalid/aweme-avatar/friend.png" width="24" height="24"><span data-e2e="share-friend-name">合成好友1</span><button data-e2e="share-friend-send">分享</button></div></div></div>
         <script>window.sendCount=0;document.querySelector('button').onclick=()=>window.sendCount++;const canvas=document.createElement('canvas');canvas.width=240;canvas.height=320;const draw=()=>{const c=canvas.getContext('2d');c.fillStyle='#143447';c.fillRect(0,0,240,320)};draw();const video=document.querySelector('video');video.srcObject=canvas.captureStream(15);void video.play();setInterval(draw,60);</script></body></html>` } : { contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"/>' }));
       const inspectionPage = owner.pages()[0]; await inspectionPage.goto('https://www.douyin.com/video/12345');
       await inspectionPage.waitForFunction(() => document.querySelector('video').readyState >= 2);
@@ -184,51 +298,56 @@ test('真实临时 Edge：1200ms 按钮等待中跨入口关闭、换作品或�
       const page = client.contexts()[0].pages().find(page => page.url().includes('/video/12345'));
       const controller = { source: 'api', pauseForLimits: async () => {}, withPage: async (action, { signal }) => {
         signal.throwIfAborted();
-        const cancel = () => { void client.close().catch(() => {}); };
+        const cancel = () => { void client.close().then(() => disconnected.resolve(), error => disconnected.reject(error)); };
         signal.addEventListener('abort', cancel, { once: true });
         try { return await action(page); } finally { signal.removeEventListener('abort', cancel); }
       } };
-      const contact = { id: friend, name: '合成好友1', displayName: '合成好友1', avatar: 'https://synthetic.invalid/aweme-avatar/friend.png', followed: true, isGroup: false };
+      const wait = page.waitForTimeout.bind(page);
+      page.waitForTimeout = async milliseconds => {
+        if (stage === 'geometry-wait' && milliseconds === 75 && !latched) { latched = true; entered.resolve(); await release.promise; }
+        return wait(milliseconds);
+      };
+      const contact = { ...f.contacts[0], displayName: '合成好友1', avatar: 'https://synthetic.invalid/aweme-avatar/friend.png' };
       const chatBrowser = { contacts: new Map([[friend, contact]]), listContacts: async () => ({ contacts: [contact] }), readConversation: async () => ({ conversation: { id: friend }, messages: [] }) };
       const forwarder = new VideoForwarder({ controller, chatBrowser, stateDir: f.stateDir, videoLimits: f.videoLimits });
       const foreign = new AutonomousShare({ personaMemory: f.personaMemory, videoLimits: f.videoLimits, stateDir: f.stateDir, now: f.clock });
-      const changed = Promise.withResolvers(); let scheduled = false, wasAnimating = false, successfullyDisabled = false;
+      let successfullyDisabled = false;
       f.service.send = async (input, controls) => {
         const authorize = async request => {
           const result = controls.authorize(request);
-          if (request.phase === 'monitor' && !scheduled) {
-            scheduled = true;
-            await inspectionPage.evaluate(() => { window.pendingAnimation = document.querySelector('button').animate([{ transform: 'translateX(0)' }, { transform: 'translateX(200px)' }], { duration: 1200, fill: 'forwards' }); });
-            timer = setTimeout(async () => {
-              try {
-                wasAnimating = await inspectionPage.evaluate(() => window.pendingAnimation.playState === 'running');
-                if (mutation === 'disabled') successfullyDisabled = foreign.configure({ enabled: false }, { explicit: true }).enabled === false;
-                else await inspectionPage.evaluate(kind => {
-                  if (kind === 'video') { document.querySelector('[data-e2e="player-container"]').className = 'video_67890'; history.replaceState(null, '', '/video/67890'); }
-                  else { document.querySelector('[data-e2e="share-friend-name"]').textContent = '合成其他好友'; document.querySelector('[data-e2e="share-friend-row"] img').src = 'https://synthetic.invalid/aweme-avatar/other.png'; }
-                }, mutation);
-                changed.resolve();
-              } catch (error) { changed.reject(error); }
-            }, 100);
-          }
+          if (stage === 'before-click' && request.phase === stage && !latched) { latched = true; entered.resolve(); await release.promise; }
           return result;
         };
         authorize.beginDispatch = controls.authorize.beginDispatch;
         return forwarder.forwardAutonomous(input, { ...controls, authorize });
       };
       f.service.configure({ enabled: true }, { explicit: true });
-      const output = await f.service.share(f.evidence()).then(result => ({ result }), error => ({ error }));
-      await changed.promise;
-      assert.equal(wasAnimating, true, `${mutation} 必须发生在真实按钮仍等待稳定时`);
+      const forwarding = f.service.share(f.evidence()).then(result => ({ result }), error => ({ error }));
+      const waitStage = async (pending, message) => {
+        let deadline;
+        try { return await Promise.race([pending, forwarding.then(output => { throw new Error(`${message}前转发已结束：${output.error?.message || JSON.stringify(output.result)}`); }), new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error(message)), 2500); })]); }
+        finally { clearTimeout(deadline); }
+      };
+      await waitStage(entered.promise, `合成转发未进入${stage}门闩`);
+      assert.equal(latched, true); assert.equal(await inspectionPage.evaluate(() => window.sendCount), 0);
+      assert.equal(await inspectionPage.locator('button').getAttribute('data-deepseek-forward-token') !== null, true, '真实输入见证已安装，测试确实进入控件核验阶段');
+      if (mutation === 'disabled') successfullyDisabled = foreign.configure({ enabled: false }, { explicit: true }).enabled === false;
+      else await inspectionPage.evaluate(kind => {
+        if (kind === 'video') { document.querySelector('[data-e2e="player-container"]').className = 'video_67890'; history.replaceState(null, '', '/video/67890'); }
+        else { document.querySelector('[data-e2e="share-friend-row"]').setAttribute('data-conversation-id', 'another-stable-account'); }
+      }, mutation);
+      await waitStage(disconnected.promise, `${stage}/${mutation}变更后监测未取消当前输入`);
+      release.resolve(); const output = await forwarding;
       if (mutation === 'disabled') assert.equal(successfullyDisabled, true, '另一个入口已经成功关闭许可');
-      assert.ok(output.error, '最终输入前中止，不能宣称成功');
+      if (stage === 'geometry-wait') assert.ok(output.error, '取得最终输入授权前中止，不发出卡片');
+      else { assert.equal(output.result?.confirmed, false); assert.equal(output.result?.deliveryUncertain, true, '已取得最终输入授权的中断按保守收据暂停，不能自动重试'); }
       assert.equal(client.isConnected(), false, '取消只断开这项操作的 CDP 客户端');
       assert.equal(inspectionPage.isClosed(), false, '临时 Edge 与页面仍可由独立检查连接读取');
-      await inspectionPage.waitForTimeout(1350);
-      assert.equal(await inspectionPage.evaluate(() => window.sendCount), 0, `${mutation} 后动画结束也不能出现延迟发送`);
-      assert.equal(f.service.ledger().operations[0].status, 'not-sent');
+      await inspectionPage.waitForTimeout(350);
+      assert.equal(await inspectionPage.evaluate(() => window.sendCount), 0, `${stage}/${mutation} 后也不能出现延迟发送`);
+      assert.equal(f.service.ledger().operations[0].status, stage === 'geometry-wait' ? 'not-sent' : 'uncertain');
       await foreign.close();
-    } finally { clearTimeout(timer); await client?.close().catch(() => {}); await owner?.close(); }
+    } finally { release.resolve(); await client?.close().catch(() => {}); await owner?.close(); }
   }
 });
 
@@ -255,8 +374,10 @@ test('真实合成输入：点击后正常禁用按钮仍可核对卡片，缺�
   try {
     for (const hasReceipt of [true, false]) {
       const f = fixture(t), page = await browser.newPage();
-      await page.route('**/*', route => route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"/>' }));
-      await page.setContent('<div data-e2e="video-share-icon-container" style="width:400px;height:200px">分享<div data-e2e="video-share-container"><div data-e2e="share-friend-row"><img src="https://synthetic.invalid/aweme-avatar/friend.png" width="24" height="24"><span data-e2e="share-friend-name">合成好友1</span><button data-e2e="share-friend-send">分享</button></div></div></div>');
+      await page.route('**/*', route => route.fulfill(route.request().resourceType() === 'document' ? { contentType: 'text/html', body: '<!doctype html><html><body></body></html>' } : { contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"/>' }));
+      await page.goto('https://www.douyin.com/video/12345');
+      await page.setContent('<div data-e2e="video-share-icon-container" style="width:400px;height:200px">分享<div data-e2e="video-share-container"><div data-e2e="share-friend-row" data-conversation-type="direct" data-conversation-id="synthetic-person-1"><img src="https://synthetic.invalid/aweme-avatar/friend.png" width="24" height="24"><span data-e2e="share-friend-name">合成好友1</span><button data-e2e="share-friend-send">分享</button></div></div></div>');
+      await page.evaluate(() => { document.body.insertAdjacentHTML('beforeend', '<section data-e2e="feed-active-video" class="video_12345"><video style="position:fixed;left:700px;top:10px;width:80px;height:50px"></video></section>'); Object.defineProperty(document.querySelector('video'), 'readyState', { value: 4 }); });
       await page.evaluate(() => {
         window.sendCount = 0;
         document.querySelector('button').onclick = event => {
@@ -270,7 +391,7 @@ test('真实合成输入：点击后正常禁用按钮仍可核对卡片，缺�
         const cancel = () => { void page.close(); }; signal.addEventListener('abort', cancel, { once: true });
         try { return await action(page); } finally { signal.removeEventListener('abort', cancel); }
       } };
-      const contact = { id: friend, name: '合成好友1', displayName: '合成好友1', avatar: 'https://synthetic.invalid/aweme-avatar/friend.png', followed: true, isGroup: false };
+      const contact = { ...f.contacts[0], displayName: '合成好友1', avatar: 'https://synthetic.invalid/aweme-avatar/friend.png' };
       const chatBrowser = { contacts: new Map([[friend, contact]]), listContacts: async () => ({ contacts: [contact] }), readConversation: async () => ({ conversation: { id: friend }, messages: hasReceipt && await realEvaluate(() => window.sendCount) ? [{ id: 'synthetic-confirmed-after-ui-change', sender: 'outgoing', arrivalClassification: 'new-tail', media: { type: 'shared-work', videoId: '12345' } }] : [] }) };
       const forwarder = new VideoForwarder({ controller, chatBrowser, stateDir: f.stateDir, videoLimits: f.videoLimits });
       f.service.send = undefined; f.service.getForwarder = async () => forwarder; f.service.configure({ enabled: true }, { explicit: true });
@@ -279,7 +400,7 @@ test('真实合成输入：点击后正常禁用按钮仍可核对卡片，缺�
       assert.equal(await realEvaluate(() => window.sendCount), 1); assert.equal(await realEvaluate(() => window.trustedClick), true);
       assert.equal(await page.locator('button').isDisabled(), true);
       assert.equal(fs.existsSync(f.service.files.control), false);
-      await assert.rejects(f.service.share(input), /重复|未确认/);
+      if (hasReceipt) assert.equal((await f.service.share(input)).code, 'SHARE_ALREADY_PROCESSED'); else await assert.rejects(f.service.share(input), /未确认/);
       assert.equal(await realEvaluate(() => window.sendCount), 1);
       await page.close();
     }

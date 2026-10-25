@@ -13,7 +13,7 @@ const recipients = [{ id: 'conv:' + 'a'.repeat(64), name: '合成问候好友甲
 function state() { return { protocol: 'spark-v1', enabled: false, running: false, starting: false, busy: false, worker: null, timeZone: 'Asia/Shanghai', policy: { enabled: false, windows: ['09:00-22:00'], dailyLimit: 2 }, daily: { date: '2026-10-15', attempts: 0, confirmed: 0, remaining: 2 }, recipients: structuredClone(recipients), needsReview: [], recent: [] }; }
 
 async function fixture(t, { assets, component = false } = {}) {
-  const fixture = { spark: state(), configured: true, connected: true, failState: false, stateHold: false, failConfigure: false, failResolve: false, holdReview: false, calls: [], errors: [], native: [] };
+  const fixture = { spark: state(), interactions: { policy: { enabled: true }, friend: { replyRunning: false, shareEnabled: true }, rows: [] }, configured: true, connected: true, failState: false, stateHold: false, failConfigure: false, failResolve: false, holdReview: false, calls: [], errors: [], native: [] };
   const token = 'synthetic-spark-session';
   const server = http.createServer(async (request, response) => {
     try {
@@ -26,6 +26,8 @@ async function fixture(t, { assets, component = false } = {}) {
         if (url.pathname === '/api/bootstrap') return reply({ service: 'douyin-api-local', token, config: { configured: fixture.configured }, spark: { available: true }, videoTime: { enabled: true }, limits: { maxSteps: 20, maxToolCalls: 20, taskTimeoutSeconds: 180 } });
         if (request.headers['x-session-token'] !== token) return reply({ error: '合成会话校验失败。' }, 403);
         if (url.pathname === '/api/state') return reply({ running: false, revision: 0, events: [] });
+        if (url.pathname === '/api/interactions/state') return reply(fixture.interactions);
+        if (url.pathname === '/api/interactions/configure') { fixture.interactions.policy.enabled = JSON.parse(raw).enabled; return reply(fixture.interactions); }
         if (url.pathname === '/api/video/status') return reply({ allowed: true, window: {}, remainingSeconds: 120, session: { status: 'active' }, policy: { windows: ['00:00-24:00'], sessionMinutes: 10 } });
         if (url.pathname === '/api/task/limits') return reply({ policy: { maxSteps: 20, maxToolCalls: 20, timeoutSeconds: 180 }, hardLimits: {} });
         if (url.pathname === '/api/chat/state') return reply({ running: false, policy: { allowlist: recipients, dailyReplyLimit: 40 }, daily: { requests: 0, limit: 40 } });
@@ -120,30 +122,25 @@ test('主动问候组件只显式保存和启停，保留草稿并拒绝无效�
   assert.equal(data.calls.filter(item => item.method === 'POST').every(item => ['/api/spark/configure', '/api/spark/start', '/api/spark/stop', '/api/spark/resolve'].includes(item.route) && item.token === 'synthetic-spark-session'), true);
 });
 
-test('主界面回读问候状态，问候运行中禁止换Key，状态失联不保留可用入口，也不阻止手动视频任务', { timeout: 40_000 }, async t => {
-  const { data, page, panel } = await fixture(t, { assets: path.join(root, 'dist') });
-  const save = panel.getByRole('button', { name: '保存自动问候设置', exact: true }); await page.waitForFunction(() => document.querySelector('[aria-label="每日问候时段"]')?.disabled === false);
-  assert.equal(data.calls.filter(item => item.method === 'POST').length, 0);
-  Object.assign(data.spark, { enabled: true, running: true, worker: { alive: true, source: 'dsh', owned: false } }); data.spark.policy.enabled = true;
-  await panel.getByText('调度中', { exact: true }).waitFor();
+test('主界面移除续火入口和轮询，默认好友总开关不受旧问候状态影响', { timeout: 40_000 }, async t => {
+  const { data, page } = await fixture(t, { assets: path.join(root, 'dist') });
+  const friend = page.getByRole('switch', { name: '允许好友互动', exact: true });
+  await page.waitForFunction(() => document.querySelector('[aria-label="允许好友互动"]')?.getAttribute('aria-checked') === 'true');
+  assert.equal(await page.locator('[aria-labelledby="spark-title"]').count(), 0);
+  assert.equal(await page.getByRole('button', { name: /自动续火花|自动问候|启用自动回复|保存自主分享/ }).count(), 0);
+  assert.equal(data.calls.some(item => item.method === 'POST'), false);
+  Object.assign(data.spark, { enabled: true, running: true, worker: { alive: true, source: 'dsh', owned: false } }); data.spark.policy.enabled = true; data.failState = true;
+  await page.waitForTimeout(1700);
+  assert.equal(data.calls.some(item => item.route.startsWith('/api/spark/')), false);
   await page.getByRole('textbox', { name: '视频任务', exact: true }).fill('只执行合成视频任务，不操作实际抖音。');
-  const videoStart = page.getByRole('button', { name: '开始任务 ↑', exact: true }); assert.equal(await videoStart.isDisabled(), false);
-  await page.getByRole('button', { name: /☷ 业务设置/ }).click();
-  await page.getByRole('tab', { name: '基础设置', exact: true }).click();
+  assert.equal(await page.getByRole('button', { name: '开始任务 ↑', exact: true }).isEnabled(), true);
+  await page.getByRole('button', { name: /☷ 业务设置/ }).click(); await page.getByRole('tab', { name: '基础设置', exact: true }).click();
   await page.getByRole('button', { name: '配置模型与 API Key', exact: true }).click(); const dialog = page.getByRole('dialog');
-  assert.equal(await dialog.getByRole('button', { name: '保存设置', exact: true }).isDisabled(), true); assert.equal(await dialog.getByRole('button', { name: '清除已保存的 API Key', exact: true }).isDisabled(), true);
-  await dialog.getByRole('button', { name: '返回', exact: true }).click();
-  await page.getByRole('button', { name: /◌ 对话与视频/ }).click();
-  data.failState = true; await panel.getByText('自动问候状态尚未核实，暂不能修改或启动，请等待本机服务回读。', { exact: true }).waitFor(); assert.equal(await save.isDisabled(), true);
-  data.failState = false; data.stateHold = true; await page.waitForTimeout(1700); assert.equal(await save.isDisabled(), true);
-  data.stateHold = false; data.spark.running = false; data.spark.worker = null;
-  await page.waitForFunction(() => document.querySelector('[aria-label="每日问候时段"]').disabled === false);
-  await page.getByRole('button', { name: /☷ 业务设置/ }).click();
-  await page.getByRole('tab', { name: '基础设置', exact: true }).click();
-  await page.getByRole('button', { name: '配置模型与 API Key', exact: true }).click(); assert.equal(await dialog.getByRole('button', { name: '保存设置', exact: true }).isDisabled(), false); await dialog.getByRole('button', { name: '返回', exact: true }).click();
-  await page.getByRole('button', { name: /◌ 对话与视频/ }).click();
-  await panel.getByRole('switch', { name: '允许自动续火花', exact: true }).click(); await save.click(); await panel.getByText('已关闭主动问候许可并请求停止服务；请以回读状态为准。', { exact: true }).waitFor();
-  assert.deepEqual(data.calls.filter(item => item.method === 'POST').map(item => ({ route: item.route, body: item.body })), [{ route: '/api/spark/configure', body: { enabled: false, windows: ['09:00-22:00'], dailyLimit: 2 } }, { route: '/api/spark/stop', body: {} }]);
-  assert.deepEqual(data.native, []); assert.deepEqual(data.errors, []);
-  assert.equal(data.calls.filter(item => item.route === '/api/spark/state').every(item => item.token === 'synthetic-spark-session'), true);
+  assert.equal(await dialog.getByRole('textbox', { name: 'API Key', exact: true }).isEnabled(), true);
+  await dialog.getByRole('button', { name: '返回', exact: true }).click(); assert.deepEqual(data.native, []);
+  await page.getByRole('tab', { name: '好友互动', exact: true }).click();
+  assert.equal(await friend.count(), 1); assert.equal(await page.getByRole('spinbutton').count(), 0);
+  await friend.click(); await page.waitForFunction(() => document.querySelector('[aria-label="允许好友互动"]').getAttribute('aria-checked') === 'false');
+  assert.deepEqual(data.calls.filter(item => item.method === 'POST').map(item => ({ route: item.route, body: item.body })), [{ route: '/api/interactions/configure', body: { enabled: false } }]);
+  assert.equal(data.calls.some(item => item.route.startsWith('/api/spark/')), false); assert.deepEqual(data.errors, []);
 });

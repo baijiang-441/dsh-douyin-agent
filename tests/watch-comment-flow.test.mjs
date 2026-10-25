@@ -50,8 +50,8 @@ test('评论默认关闭、没有额度、未确认暂停或决策夹带正文�
 });
 
 test('专用评论模型也占请求预算，额度不足时不生成、不发布且保持有限轮次', async t => {
-  const f = fixture(t); f.commentService.configure({ enabled: true }, { explicit: true }); f.watch.start({ startSession: true, maxRequests: 1 }, { explicit: true }); await f.watch.completion;
-  assert.equal(f.watch.state().status, 'limited'); assert.equal(f.watch.state().counts.requests, 1); assert.equal(f.counts().generated, 0); assert.equal(f.posts.length, 0); assert.ok(Number.isFinite(f.videoLimits.state().session.expiresAt));
+  const f = fixture(t);f.videoLimits.savePolicy({dailyRequests:1},{explicit:true}); f.commentService.configure({ enabled: true }, { explicit: true }); f.watch.start({ startSession: true, maxRequests: 1 }, { explicit: true }); await f.watch.completion;
+  assert.equal(f.watch.state().status, 'limited'); assert.equal(f.watch.state().counts.requests, 1); assert.equal(f.counts().generated, 0); assert.equal(f.posts.length, 0); assert.equal(f.videoLimits.state().daily.remainingRequests,0);
 });
 
 test('未确认公开评论立即停止watch并保留核对状态，没有第二条自动评论', async t => {

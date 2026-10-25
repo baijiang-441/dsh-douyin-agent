@@ -40,6 +40,15 @@ function safeUsage(value){
   if(!value||typeof value!=='object')return null;
   return Object.fromEntries(['prompt_tokens','completion_tokens','total_tokens'].filter(key=>Number.isFinite(value[key])&&value[key]>=0).map(key=>[key,value[key]]));
 }
+function isLocalWhisperNoSpeech(value) {
+  const keys=['text','segments','language','languageProbability','language_probability','duration','task'];
+  return value && typeof value==='object' && !Array.isArray(value) && Object.keys(value).every(key=>keys.includes(key))
+    && typeof value.text==='string' && !value.text.trim() && Array.isArray(value.segments) && value.segments.length===0
+    && (value.language===undefined || typeof value.language==='string' && value.language.length<=32)
+    && ['languageProbability','language_probability'].every(key=>value[key]===undefined || Number.isFinite(value[key]) && value[key]>=0 && value[key]<=1)
+    && (value.duration===undefined || Number.isFinite(value.duration) && value.duration>0)
+    && (value.task===undefined || value.task==='transcribe');
+}
 export async function validatePublicMediaUrl(source) {
   let url;
   try { url = new URL(source); } catch { throw new Error('媒体 URL 格式错误。'); }
@@ -251,7 +260,7 @@ export class MediaAdapter {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(),'douyin-media-'));
     try {
       const prepared = await this.prepare(args,kind,runtime,directory,combined);
-      let output;
+      let output, noSpeech=false;
       const currentSettings=await this.settings();
       if(!currentSettings.enabled)return{ok:false,status:'disabled',backend,kind,error:'准备媒体期间用户关闭了能力，未交给模型。'};
       if(currentSettings.backend!==backend)return{ok:false,status:'backend-not-selected',backend:currentSettings.backend,kind,error:'准备媒体期间用户切换了后端，本次任务未交给模型。'};
@@ -260,11 +269,15 @@ export class MediaAdapter {
         if (endpoint.protocol!=='http:' || endpoint.hostname!=='127.0.0.1') throw new Error('本地 Whisper 服务必须在 127.0.0.1 HTTP 上。');
         const bytes = await fs.readFile(prepared.path);
         // 直接复用 dsh-voice 的 WAV、自动语言及禁止翻译的 provider。
-        output = await makeProviders({resolveKey:async()=>'',fetchImpl:this.fetch,cfg:{whisperUrl:endpoint.href}}, {bytes,mime:'audio/wav',lang:args.language||'auto',signal:combined})['local-whisper']();
-        if (!output.ok) throw new Error('本地 Whisper 服务未返回有效转写。');
+        let rawOutput;
+        const fetchLocal=async(...request)=>{const response=await this.fetch(...request);if(response.ok){try{rawOutput=await response.clone().json();}catch{}}return response;};
+        output = await makeProviders({resolveKey:async()=>'',fetchImpl:fetchLocal,cfg:{whisperUrl:endpoint.href}}, {bytes,mime:'audio/wav',lang:args.language||'auto',signal:combined})['local-whisper']();
+        noSpeech=output.ok===false && output.reason==='empty transcript' && isLocalWhisperNoSpeech(rawOutput);
+        if (!output.ok && !noSpeech) throw new Error('本地 Whisper 服务未返回有效转写。');
       } else if (backend==='local-whisper') {
         output = JSON.parse(await run(runtime.python,[path.join(ROOT,'local_whisper.py')],{input:{path:prepared.path,language:args.language||'auto',model:config.DOUYIN_MEDIA_WHISPER_MODEL||'tiny',modelsDir:runtime.modelsDir},signal:combined,timeoutMs:this.limits.processTimeoutMs,maxOutputBytes:200_000}));
-        if (!output.text?.trim()) throw new Error('Whisper 未识别到可用对白；没有把静音当成内容。');
+        noSpeech=isLocalWhisperNoSpeech(output);
+        if (typeof output?.text!=='string' || !output.text.trim() && !noSpeech) throw new Error('Whisper 未返回合法转写结果，未猜测声音内容。');
       } else if (backend==='mimo') {
         const requestKind = kind==='video'?'video':kind==='transcription'?'asr':'audio';
         const body = JSON.parse(await run(runtime.python,[path.join(ROOT,'mimo_bridge.py')],{input:{kind:requestKind,model:kind==='video'?(config.DOUYIN_MEDIA_MIMO_VIDEO_MODEL||'mimo-v2.5'):kind==='transcription'?'mimo-v2.5-asr':(config.DOUYIN_MEDIA_MIMO_AUDIO_MODEL||'mimo-v2.6'),files:[{kind:kind==='video'?'video':'audio',mime:kind==='video'?'video/mp4':'audio/wav',path:prepared.path}],prompt:kind==='transcription'?'':args.question||'请说明这段媒体中实际可观察到的内容，并明确不确定之处。',language:args.language,fps:args.fps??1},signal:combined,timeoutMs:30_000,maxOutputBytes:this.limits.maxBytes*2}));
@@ -283,6 +296,7 @@ export class MediaAdapter {
         output = { text:data.text,segments:Array.isArray(data.segments)?data.segments.map(item=>({start:Number(item.start??0),end:Number(item.end??0),text:String(item.text??''),...(typeof item.speaker==='string'?{speaker:item.speaker}:{})})):[],duration:data.duration??null };
       }
       combined.throwIfAborted();
+      if(noSpeech)return{ok:false,status:'no-speech',backend,kind,text:'',segments:[],source:prepared.descriptor,interval:prepared.interval,language:typeof output.language==='string'?safeText(output.language,config).slice(0,32):null,usage:null,limitations:['本地识别没有识别到对白，无法据此确定是否静音、声音太轻或听不清；没有推断环境声。']};
       return { ok:true,backend,kind,text:safeText(output.text,config),...(output.segments?{segments:output.segments.filter(item=>Number.isFinite(item.start)&&Number.isFinite(item.end)&&item.start>=0&&item.end>=item.start).map(item=>({relativeStart:item.start,relativeEnd:item.end,start:prepared.interval.startSeconds+item.start,end:prepared.interval.startSeconds+item.end,text:safeText(item.text,config),...(typeof item.speaker==='string'?{speaker:safeText(item.speaker,config)}:{})}))}:{}),source:prepared.descriptor,interval:prepared.interval,language:output.language||args.language?safeText(output.language||args.language,config).slice(0,32):null,usage:safeUsage(output.usage),limitations:[...(prepared.clipped?['仅处理所标明的时间片段，没有分析完整媒体。']:[]),...(prepared.unknownSourceDuration?['录制文件未提供总时长；返回的是有界转码后实测的音频时长。']:[]),kind==='transcription'?'结果是语音转写，不能证明已理解音乐或环境声。':'结果来自所选媒体模型；未另行确认每种声音的识别准确性。',...(kind==='video'?['视频模型是否完整理解音轨尚未独立验收，需要对白时应另做语音转写。']:[])] };
     } catch(error) { if (combined.aborted) throw combined.reason; return {ok:false,status:'failed',backend,kind,error:safeText(error.message,config)}; }
     finally { clearTimeout(budget); await cleanTemporary(directory); }

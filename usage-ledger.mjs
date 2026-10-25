@@ -29,7 +29,7 @@ export class UsageLedger {
     const todayKey = date(this.now()), total = empty(), today = empty(), groups = new Map(), days = new Map(), seen = new Set(); let damagedRecords = 0;
     const files = fs.existsSync(this.directory) ? fs.readdirSync(this.directory).filter(file => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(file)).sort().slice(-30) : [];
     const signature = todayKey + files.map(file => { const stat = fs.lstatSync(path.join(this.directory, file)); return `${file}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`; }).join('|');
-    const previous = summaries.get(this.directory); if (previous?.signature === signature) return structuredClone(previous.value);
+    const previous = summaries.get(this.directory); if (previous?.signature === signature) return {...structuredClone(previous.value),checkedAt:new Date(this.now()).toISOString()};
     for (const file of files) {
       const full = path.join(this.directory, file), stat = fs.lstatSync(full);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 32 * 1024 * 1024) { damagedRecords++; continue; }
@@ -44,6 +44,6 @@ export class UsageLedger {
     }
     const value = { protocol: 'usage-ledger-v1', date: todayKey, today, total, days: [...days.values()], groups: [...groups.values()], damagedRecords, period: '最近30个有记录的日期', note: '从本版开始记录本助手发起的模型响应；DSH 普通会话、失败且未返回用量的请求和云端音频不计入。未报告的用量标为未知，不能据此当作零消耗。' };
     if (summaries.size >= 20) summaries.delete(summaries.keys().next().value);
-    summaries.set(this.directory, { signature, value }); return structuredClone(value);
+    summaries.set(this.directory, { signature, value }); return {...structuredClone(value),checkedAt:new Date(this.now()).toISOString()};
   }
 }

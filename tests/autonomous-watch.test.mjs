@@ -50,12 +50,12 @@ test('跨上海午夜结束的一轮分别保留开始日与结束日的事实�
   assert.equal(f.watch.reportService.read({ date: '2026-10-15' }).observedCount, 1);
 });
 
-test('默认停止且无轮次不能启动；显式启动也不延长已有有限轮次', async t => {
+test('默认停止且允许关闭不能启动，允许后可自动建立内部运行', async t => {
   const f = fixture(t); assert.equal(f.watch.state().running, false); assert.equal(f.calls.length, 0);
-  assert.throws(() => f.watch.start({}, { explicit: true }), /开始新一轮/); assert.throws(() => f.watch.start({ startSession: true }), /明确启动/);
+  assert.throws(() => f.watch.start({startSession:false}, { explicit: true }), /关闭/); assert.throws(() => f.watch.start({ startSession: true }), /明确启动/);
   const session = f.videoLimits.markSession('api', { explicit: true });
   f.watch.start({ startSession: true, maxRequests: 1 }, { explicit: true }); await f.watch.completion;
-  assert.equal(f.videoLimits.state().session.id, session.session.id); assert.equal(f.videoLimits.state().session.expiresAt, session.session.expiresAt); assert.equal(f.watch.state().counts.requests, 1); assert.equal(f.paused(), 1);
+  assert.equal(f.videoLimits.state().session.id, session.session.id); assert.equal(f.videoLimits.state().session.expiresAt, session.session.expiresAt); assert.equal(f.watch.state().counts.requests, 1, JSON.stringify({state:f.watch.state(),events:f.events.slice(-3)})); assert.equal(f.paused(), 1);
 });
 
 test('真实采样结果先进入共同证据，再结构化选择搜索/停留/跳过，兴趣与SQLite笔记均可回读', async t => {
@@ -105,11 +105,10 @@ test('模型JSON漏写停留时长时宿主默认三秒，随后停止仍保留�
   assert.equal(f.watch.state().status, 'stopped');
   assert.deepEqual(waits, [3000]);
   assert.equal(f.watch.state().counts.requests, 2);
-  assert.equal(f.watch.state().counts.maxRequests, 2);
+  assert.equal(f.watch.state().counts.maxRequests, null);
   assert.equal(f.videoLimits.state().session.id, session.id);
   assert.equal(f.videoLimits.state().session.expiresAt, session.expiresAt);
-  assert.throws(() => f.watch.start({ maxRequests: 100 }, { explicit: true }), /预算已用完/);
-  assert.equal(f.watch.state().counts.requests, 2);
+  assert.equal(f.watch.state().counts.dailyRequests,2);assert.equal(f.watch.state().counts.dailyLimit,30);
   assert.equal(f.events.find(event => event.type === 'watch.decision' && event.decision.action === 'stay').decision.seconds, 3);
   assert.equal(f.paused(), 1);
 });
@@ -129,7 +128,7 @@ test('仅移除不适用于当前动作的空值，不改写调用方数据或�
   }
 });
 
-test('时长兼容只接受安全整数，不允许非法类型、非空跨动作参数或未知字段', () => {
+test('时长兼容只接受安全整数，不允许非法类型、越权联系人或未知字段', () => {
   assert.equal(parseWatchDecision(choice('stay')).seconds, 3);
   assert.equal(parseWatchDecision(choice('stay', { seconds: undefined })).seconds, 3);
   for (const seconds of [null, 0, -1, 1.5, '', '2', false, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
@@ -142,10 +141,86 @@ test('时长兼容只接受安全整数，不允许非法类型、非空跨动�
       assert.equal(Object.hasOwn(parseWatchDecision(value), 'seconds'), false);
     }
   }
-  for (const extra of [{ seconds: -1 }, { seconds: 1.5 }, { seconds: '0' }, { seconds: false }, { seconds: '' }, { seconds: NaN }, { seconds: Infinity }, { seconds: Number.MAX_SAFE_INTEGER + 1 }, { query: '猫咪' }, { recipientId: `conv:${'a'.repeat(64)}` }, { url: null }]) {
+  for (const extra of [{ seconds: -1 }, { seconds: 1.5 }, { seconds: '0' }, { seconds: false }, { seconds: '' }, { seconds: NaN }, { seconds: Infinity }, { seconds: Number.MAX_SAFE_INTEGER + 1 }, { query: {} }, { query: '猫'.repeat(101) }, { recipientId: `conv:${'a'.repeat(64)}` }, { url: null }]) {
     assert.throws(() => parseWatchDecision(choice('skip', extra)));
   }
   for (const query of [undefined, null, '', ' ']) assert.throws(() => parseWatchDecision(choice('search', { query, seconds: 0 })), /关键词/);
+});
+
+test('skip、stay与stop忽略模型多带的短搜索词，搜索参数及外发权限仍校验', () => {
+  for (const action of ['skip', 'stay', 'stop']) {
+    const value = Object.freeze(choice(action, { query: '模型多带的搜索词' }));
+    const parsed = parseWatchDecision(value);
+    assert.equal(parsed.action, action);
+    assert.equal(Object.hasOwn(parsed, 'query'), false);
+    assert.equal(value.query, '模型多带的搜索词');
+    assert.throws(() => parseWatchDecision({ ...value, recipientId: `conv:${'a'.repeat(64)}` }), /许可好友/);
+  }
+  for (const query of [null, '', ' ', '猫'.repeat(101)]) assert.throws(() => parseWatchDecision(choice('search', { query })), /关键词/);
+  assert.throws(() => parseWatchDecision(choice('share', { query: '猫咪', recipientId: `conv:${'a'.repeat(64)}` })), /关键词/);
+  assert.throws(() => parseWatchDecision(choice('comment', { query: '猫咪' })), /关键词/);
+});
+
+test('旧换片回执changed为空时，以不同且就绪的作品ID确认，未换片或未就绪仍停止', async t => {
+  for (const mode of ['different', 'same', 'unready']) {
+    const f = fixture(t), execute = f.controller.execute;
+    const queue = [choice('skip', { query: '多余词' }), choice('stop')];
+    f.provider(async () => ({ text: JSON.stringify(queue.shift()) }));
+    f.controller.execute = async (name, ...rest) => {
+      const before = f.state();
+      const result = await execute(name, ...rest);
+      if (name !== 'douyin_next') return result;
+      return { ...result, changed: null, state: mode === 'same' ? before : mode === 'unready' ? { ...result.state, video: { ...result.state.video, readyState: 1 } } : result.state };
+    };
+    f.watch.start({ startSession: true, maxRequests: 2 }, { explicit: true }); await f.watch.completion;
+    assert.equal(f.watch.state().status, mode === 'different' ? 'stopped' : 'failed');
+    assert.equal(f.watch.state().counts.requests, mode === 'different' ? 2 : 1);
+  }
+});
+
+test('skip通过内部controls绑定观察作品，等待后读到新片才继续且不把控制字段交工具参数', async t => {
+  const f = fixture(t), execute = f.controller.execute, expectedVideoId = f.state().video.id, queue = [choice('skip'), choice('stop')];
+  f.provider(async () => ({ text: JSON.stringify(queue.shift()) }));
+  f.controller.execute = async (name, args, controls) => { if (name === 'douyin_next') { assert.equal(controls.expectedVideoId, expectedVideoId); assert.deepEqual(args, {}); await new Promise(resolve => setTimeout(resolve, 20)); } return execute(name, args, controls); };
+  f.watch.start({ startSession: true }, { explicit: true }); await f.watch.completion;
+  assert.equal(f.watch.state().status, 'stopped'); assert.equal(f.watch.state().counts.requests, 2); assert.equal(f.calls.filter(item => item.name === 'douyin_next').length, 1); assert.equal(f.calls.filter(item => item.name !== 'douyin_next').some(item => item.options.expectedVideoId !== undefined), false);
+});
+
+const liveState = (roomId = '12345678') => ({ url: 'https://www.douyin.com/?recommend=1', video: null, pageKind: 'live-preview', livePreview: { recognized: true, source: 'active-feed-live-link', scope: 'recommend-feed', roomId } });
+
+test('推荐流遇到已核实直播预览时有限跳过，只采后续作品且不增加模型次数', async t => {
+  const f = fixture(t), execute = f.controller.execute;
+  let showingLive = true;
+  f.controller.execute = async (name, ...rest) => {
+    if (showingLive && name === 'douyin_status') return liveState();
+    if (showingLive && name === 'douyin_observe') throw new Error('不应采集直播');
+    if (showingLive && name === 'douyin_next') { showingLive = false; const result = await execute(name, ...rest); return { ...result, changed: null }; }
+    return execute(name, ...rest);
+  };
+  f.watch.start({ startSession: true, maxRequests: 1 }, { explicit: true }); await f.watch.completion;
+  assert.equal(f.watch.state().status, 'stopped');
+  assert.equal(f.watch.state().counts.requests, 1);
+  assert.equal(f.calls.filter(call => call.name === 'douyin_next').length, 1);
+  assert.equal(f.calls.filter(call => call.name === 'douyin_observe').length, 1);
+  assert.equal(f.calls.some(call => call.name === 'douyin_open'), false);
+  assert.equal(f.events.filter(event => event.type === 'watch.live_skip').length, 1);
+});
+
+test('连续直播、验证码或缺少明确直播证据时不无限换片或调用模型', async t => {
+  for (const mode of ['endless', 'verification', 'unknown']) {
+    const f = fixture(t); let nexts = 0, requests = 0;
+    f.provider(async () => { requests++; return { text: JSON.stringify(choice()) }; });
+    f.controller.execute = async name => {
+      if (name === 'douyin_next') nexts++;
+      return mode === 'unknown' ? { video: null, pageKind: 'unknown', url: 'https://www.douyin.com/?recommend=1' }
+        : { ...liveState(String(12345678 + nexts)), ...(mode === 'verification' ? { verificationRequired: true } : {}) };
+    };
+    f.watch.start({ startSession: true, maxRequests: 1 }, { explicit: true }); await f.watch.completion;
+    assert.equal(f.watch.state().status, mode === 'unknown' ? 'failed' : 'needs_user');
+    assert.equal(nexts, mode === 'endless' ? 3 : 0);
+    assert.equal(requests, 0);
+    assert.equal(f.watch.state().counts.requests, 0);
+  }
 });
 
 test('时长错误只诊断动作及数字或类型，不包含理由、人格或字符串原值', () => {
@@ -179,19 +254,17 @@ test('空字段兼容后分享和评论仍要求有效许可与剩余额度', ()
   }
 });
 
-test('同轮预算在停止、重新构造及失败后保持；预算耗尽不再采样或自行续轮', async t => {
-  const f = fixture(t); f.provider(async () => ({ text: JSON.stringify(choice('skip')) }));
-  f.watch.start({ startSession: true, maxRequests: 2 }, { explicit: true }); const sessionId = f.watch.sessionId; await f.watch.completion;
-  assert.equal(f.watch.state().status, 'limited'); assert.equal(f.watch.state().counts.requests, 2); assert.equal(f.calls.filter(call => call.name === 'douyin_observe').length, 2);
-  const other = f.other('dsh'); assert.equal(other.state().running, false); assert.throws(() => other.start({ maxRequests: 100 }, { explicit: true }), /预算已用完/); assert.equal(other.state().counts.requests, 2); assert.equal(f.videoLimits.state().session.id, sessionId);
-  f.videoLimits.markSession('api', { explicit: true }); f.provider(async () => { throw new Error('合成网络故障'); });
-  other.start({ maxRequests: 2 }, { explicit: true }); await other.completion; assert.equal(other.state().counts.requests, 1); assert.equal(other.state().status, 'failed');
+test('每日请求在停止、重构及失败后保持，内部运行不能重置今日额度',async t=>{
+ const f=fixture(t);f.videoLimits.savePolicy({dailyRequests:2},{explicit:true});f.provider(async()=>({text:JSON.stringify(choice('skip'))}));
+ f.watch.start({startSession:true,maxRequests:1000001},{explicit:true});const sessionId=f.watch.sessionId;await f.watch.completion;assert.equal(f.watch.state().status,'limited');assert.equal(f.watch.state().counts.dailyRequests,2);
+ const other=f.other('dsh');assert.throws(()=>other.start({maxRequests:1000001},{explicit:true}),/次数已用完/);assert.equal(f.videoLimits.state().session.id,sessionId);assert.throws(()=>f.videoLimits.markSession('api',{explicit:true}),/次数已用完/);
+ f.videoLimits.savePolicy({dailyRequests:3},{explicit:true});f.provider(async()=>{throw new Error('合成网络故障');});other.start({maxRequests:2},{explicit:true});await other.completion;assert.equal(other.state().counts.dailyRequests,3);assert.equal(other.state().status,'failed');
 });
 
 test('时限会中止后续模型动作，超过180秒不靠新任务续跑，模型每步不带任意工具', async t => {
   const f = fixture(t); let requests = 0;
   f.videoLimits.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: 5 }, { explicit: true });
-  f.provider(async () => { requests++; f.advance(requests === 1 ? 181_000 : 200_000); return { text: JSON.stringify(choice('skip')) }; });
+  f.provider(async () => { requests++;for(let i=0;i<(requests===1?181:200);i++){f.advance(1000);f.videoLimits.notePlayback('api',f.state());}return { text: JSON.stringify(choice('skip')) }; });
   f.watch.start({ startSession: true }, { explicit: true }); await f.watch.completion;
   assert.equal(requests, 2); assert.equal(f.watch.state().status, 'limited'); assert.equal(f.calls.filter(call => call.name === 'douyin_next').length, 1); assert.equal(f.watch.state().counts.requests, 2);
 });
@@ -239,7 +312,7 @@ test('无法识别的帧、登录页和模型任意动作都失败关闭，不�
 
 test('每日上限独立于新视频轮次，已死进程残留只能明确停止后清理', async t => {
   const f = fixture(t); fs.writeFileSync(f.watch.files.budget, JSON.stringify({ version: 1, sessions: {}, days: { '2026-10-15': 20000 } }));
-  assert.throws(() => f.watch.start({ startSession: true }, { explicit: true }), /预算已用完/); assert.equal(f.calls.length, 0);
+  assert.throws(() => f.watch.start({ startSession: true }, { explicit: true }), /次数已用完/); assert.equal(f.calls.length, 0);
   assert.equal(f.videoLimits.state().session, null);
   fs.writeFileSync(f.watch.files.budget, JSON.stringify({ version: 1, sessions: {}, days: {} }));
   f.videoLimits.markSession('api', { explicit: true });

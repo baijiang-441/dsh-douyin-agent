@@ -58,9 +58,9 @@ test('确认回执精确绑定作品和commentId，预留扣每日与单轮次�
 test('停启同一轮不重置次数，新轮只重置单轮额度，跨日也不重复旧作品', async t => {
   const f = fixture(t); f.service.configure({ enabled: true, dailyLimit: 3, perSessionLimit: 1 }, { explicit: true }); const first = f.evidence(); await f.service.comment(first, f.controls);
   f.lock(); await assert.rejects(f.service.comment(f.evidence('67890'), f.controls), /次数/);
-  f.videoLimits.markSession('api', { explicit: true }); f.lock(); assert.equal(f.service.state().session.remaining, 1); await assert.rejects(f.service.comment(first, f.controls), /重复/);
+  f.videoLimits.endSession({explicit:true}); f.videoLimits.markSession('api', { explicit: true }); f.lock(); assert.equal(f.service.state().session.remaining, 1); await assert.rejects(f.service.comment(first, f.controls), /重复/);
   await f.service.comment(f.evidence('67890'), f.controls); assert.equal(f.service.state().daily.attempts, 2);
-  f.setNow(Date.parse('2026-10-15T16:01:00Z')); f.videoLimits.markSession('api', { explicit: true }); f.lock(); assert.equal(f.service.state().daily.remaining, 3); await assert.rejects(f.service.comment(first, f.controls), /重复/); assert.equal(f.calls.length, 2);
+  f.setNow(Date.parse('2026-10-15T16:01:00Z')); f.videoLimits.endSession({explicit:true}); f.videoLimits.markSession('api', { explicit: true }); f.lock(); assert.equal(f.service.state().daily.remaining, 3); await assert.rejects(f.service.comment(first, f.controls), /重复/); assert.equal(f.calls.length, 2);
 });
 test('输入不可用和发布前失败不退次数，也不自动重试同作品', async t => {
   const f = fixture(t, { post: async () => ({ confirmed: false, deliveryUncertain: false, needsUserAction: true, reason: '合成未打开评论面板' }) }); f.service.configure({ enabled: true, perSessionLimit: 3 }, { explicit: true }); const input = f.evidence(), result = await f.service.comment(input, f.controls);
@@ -83,7 +83,7 @@ test('另一入口关闭、结束轮次、丢失观察或更换run都在最终�
     let f; f = fixture(t, { post: async (input, controls) => {
       controls.authorize({ phase: 'prepare', videoId: input.expectedVideoId });
       if (mutation === 'disabled') new AutonomousComments({ personaMemory: f.personaMemory, videoLimits: f.videoLimits, stateDir: f.stateDir, now: f.clock }).configure({ enabled: false }, { explicit: true });
-      if (mutation === 'session') f.videoLimits.markSession('api', { explicit: true });
+      if (mutation === 'session') f.videoLimits.endSession({ explicit: true });
       if (mutation === 'evidence') f.personaMemory.snapshot = () => ({ recentObservations: [] });
       if (mutation === 'run') fs.writeFileSync(path.join(f.stateDir, 'watch-loop.lock'), JSON.stringify({ pid: process.pid, source: 'api', runId: 'different', sessionId: f.videoLimits.state().session.id, status: 'running' }));
       controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); assert.fail('撤回后不得发布');

@@ -8,13 +8,14 @@ import { once } from 'node:events';
 import { ChatAgent } from '../chat-agent.mjs';
 import { ChatService } from '../chat-service.mjs';
 import { OutboundCoordinator } from '../outbound-send.mjs';
+import { acquireFriendInteractionDispatch, readFriendInteractionsEnabled } from '../friend-interactions-guard.mjs';
 const config = { apiKey: 'fixture-chat-key', baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' };
-const contact = { id: 'synthetic-1', name: '合成联系人', followed: true, isGroup: false };
+const contact = { id: `conv:${'1'.repeat(64)}`, name: '合成联系人', followed: true, isGroup: false, identityVerified: true, identityBinding: `binding:${'2'.repeat(64)}`, identityVersion: 2, identityKind: 'rendered-user', identityHash: '1'.repeat(64) };
 const message = (id, text, sender = 'incoming') => ({ id, text, sender, eligibleForReply: true });
 function fixture(t, options = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-chat-test-'));
   const messages = [message('old', '启动前的旧消息，不应回复')]; const sent = []; const inputs = [];
-  const browser = { listContacts: async () => ({ contacts: [contact] }), readConversation: async (id, args) => { assert.equal(args.allowed, true); assert.equal(id, contact.id); return { conversation: { id }, messages: [...messages] }; }, sendMessage: async (id, text, args) => { assert.equal(args.allowed, true); sent.push({ id, text }); return { confirmed: true, messageId: `sent-${sent.length}` }; }, ...options.browser };
+  const browser = { listContacts: async () => ({ contacts: [contact] }), readConversation: async (id, args) => { assert.equal(args.allowed, true); assert.equal(id, contact.id); return { conversation: { id }, contact: { ...contact }, messages: [...messages] }; }, sendMessage: async (id, text, args) => { assert.equal(args.allowed, true); sent.push({ id, text }); return { confirmed: true, messageId: `sent-${sent.length}` }; }, ...options.browser };
   const agent = { replyTokens: 512, reply: async (value) => { inputs.push(value.messages.map((item) => ({ ...item }))); return { text: '[自动回复] 合成测试回复' }; }, ...options.agent };
   const service = new ChatService({ browser, config, agent, stateDir: directory });
   t.after(async () => { await service.close(); const target = path.resolve(directory); if (!target.startsWith(path.resolve(os.tmpdir()) + path.sep)) throw new Error('测试清理目录越界。'); fs.rmSync(target, { recursive: true, force: true }); });
@@ -22,6 +23,13 @@ function fixture(t, options = {}) {
 }
 const prepare = async (f, limit = 40) => { await f.service.configure({ recipientIds: [contact.id], dailyReplyLimit: limit }); await f.service.start({ schedule: false }); };
 const pixel='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jPEkAAAAASUVORK5CYII=';
+
+test('浏览器确认尚未点击时显示未发送暂停，不误标为送达不明或自动重试', async t => {
+  const f = fixture(t, { browser: { sendMessage: async () => { f.sent.push({ attempted: true }); return { confirmed: false, deliveryUncertain: false, failureStage: 'trial', failureCode: 'CHAT_SEND_INPUT_UNAVAILABLE' }; } } });
+  await prepare(f); f.messages.push(message('new-before-click', '合成未点击检查')); await f.service.poll();
+  const row = f.service.state().contacts[0]; assert.equal(row.status, 'paused'); assert.equal(row.pending.phase, 'not-sent'); assert.match(row.reason, /未点击发送/); assert.equal(f.sent.length, 1); assert.equal(f.inputs.length, 1);
+  await f.service.poll();assert.equal(f.service.state().contacts[0].status,'ready');assert.equal(f.service.state().recovery.pendingManualCount,1);assert.equal(f.sent.length,1);
+});
 
 test('新表情只截取指定消息再交模型，重复轮询不重复发送',async t=>{
   let received;
@@ -67,10 +75,10 @@ test('等共同发送锁期间本人已经回复，原生成回复不会补发',
   f.messages.push(message('human', '本人已回复', 'outgoing')); await f.service.poll(); await f.service.poll();
   assert.equal(f.sent.length, 0); assert.equal(f.inputs.length, 1); assert.equal(f.service.state().contacts[0].pending.phase, 'handled-by-user');
 });
-test('白名单必须核对关注关系和非群聊；只读也不接受第三个联系人', async (t) => {
+test('白名单须先核对，未核对会话和名单外只读请求均拒绝', async (t) => {
   const f = fixture(t, { browser: { listContacts: async () => ({ contacts: [{ ...contact, followed: null }] }) } });
   await assert.rejects(f.service.configure({ recipientIds: [contact.id] }), /核对/);
-  await assert.rejects(f.service.configure({ recipientIds: ['1','2','3'] }), /最多两个/);
+  await assert.rejects(f.service.configure({ recipientIds: Array.from({ length: 51 }, (_, index) => `synthetic-${index}`) }), /核对/);
   await assert.rejects(f.service.readConversation('other-person'), /白名单/);
   await assert.rejects(f.service.start({ schedule: false }), /白名单/);
 });
@@ -90,10 +98,43 @@ test('发送未确认后挂起联系人，重启和重复轮询均不盲目重�
   f.service.stop(); await assert.rejects(f.service.start({ schedule: false }), /人工核对/);
   f.service.resumeContact(contact.id); await f.service.start({ schedule: false }); await f.service.poll(); assert.equal(f.inputs.length, 1);
 });
-test('每日模型请求预算计入失败尝试，达到上限后不补发旧消息', async (t) => {
-  const f = fixture(t); await prepare(f, 1); f.messages.push(message('new-1', '第一个问题')); await f.service.poll();
-  f.messages.push(message('new-2', '第二个问题')); await f.service.poll(); assert.equal(f.inputs.length, 1); assert.equal(f.service.state().contacts[0].status, 'budget-paused');
+test('旧每日上限不再限制请求，超过200次后仍计数并正常回复', async (t) => {
+  const f = fixture(t); await prepare(f, 1);const date=f.service.state().daily.date;
+  f.service.watermarks.days[date]=200;f.service.persist();
+  f.messages.push(message('new-1', '第一个问题')); await f.service.poll();
+  f.messages.push(message('new-2', '第二个问题')); await f.service.poll(); assert.equal(f.inputs.length, 2); assert.equal(f.service.state().contacts[0].status, 'ready');
+  assert.deepEqual(f.service.state().daily,{date,requests:202,limit:null,remaining:null});
 });
+
+test('旧policy的40次限制读取即归一无限，不修改已有计数',async t=>{
+  const f=fixture(t);await f.service.configure({recipientIds:[contact.id]});
+  const policy=JSON.parse(fs.readFileSync(f.service.policyFile,'utf8'));policy.dailyReplyLimit=40;fs.writeFileSync(f.service.policyFile,JSON.stringify(policy));
+  assert.equal(f.service.state().policy.dailyReplyLimit,null);await f.service.start({schedule:false});
+  const date=f.service.state().daily.date;f.service.watermarks.days[date]=201;f.service.persist();f.messages.push(message('after-legacy-cap','合成旧限制迁移后新消息'));await f.service.poll();assert.equal(f.sent.length,1);assert.equal(f.service.state().daily.requests,202);
+});
+test('好友互动总开关默认开启，关闭后停止轮询且拒绝重新启动',async t=>{
+  const f=fixture(t);assert.equal(readFriendInteractionsEnabled(f.directory),true);await prepare(f);f.messages.push(message('new','合成未处理消息'));
+  fs.writeFileSync(path.join(f.directory,'friend-interactions-policy.json'),JSON.stringify({version:1,enabled:false}));await f.service.poll();assert.equal(f.inputs.length,0);assert.equal(f.sent.length,0);assert.equal(f.service.state().running,false);
+  await assert.rejects(f.service.start({schedule:false}),/总开关/);
+});
+
+test('生成过程中另一入口关闭总开关，最终核对不发送迟到回复',async t=>{
+  let f;f=fixture(t,{agent:{reply:async()=>{fs.writeFileSync(path.join(f.directory,'friend-interactions-policy.json'),JSON.stringify({version:1,enabled:false}));return{text:'合成迟到回复'};}}});
+  await prepare(f);f.messages.push(message('new','合成待回复'));await f.service.poll();assert.equal(f.sent.length,0);assert.equal(f.service.state().contacts[0].status,'paused');
+});
+
+test('总开关损坏时不启动，不把损坏内容当默认开启',async t=>{
+  const f=fixture(t);await f.service.configure({recipientIds:[contact.id]});fs.writeFileSync(path.join(f.directory,'friend-interactions-policy.json'),'损坏的总开关');await assert.rejects(f.service.start({schedule:false}),/总开关记录损坏/);assert.equal(f.sent.length,0);
+});
+
+test('回复最终短输入核对总开关并持有共用guard，其他入口不能同时写关闭',async t=>{
+  let f;f=fixture(t,{browser:{sendMessage:async(id,text,{authorize})=>{
+    assert.equal(authorize({phase:'prepare',recipientId:id}),true);assert.equal(authorize({phase:'before-click',recipientId:id}),true);const release=authorize.beginDispatch();
+    try{assert.throws(()=>acquireFriendInteractionDispatch(f.directory),error=>error.code==='FRIEND_INTERACTIONS_BUSY');assert.equal(readFriendInteractionsEnabled(f.directory),true);}finally{release();}
+    f.sent.push({id,text});return{confirmed:true,messageId:'synthetic-final-confirmed'};
+  }}});await prepare(f);f.messages.push(message('new','合成最终许可'));await f.service.poll();assert.equal(f.sent.length,1);assert.equal(fs.existsSync(path.join(f.directory,'friend-interactions-control.guard')),false);
+});
+
 test('暂停能中断模型请求，不进入发送', async (t) => {
   let started; const startedPromise = new Promise((resolve) => { started = resolve; });
   const f = fixture(t, { agent: { reply: ({ signal }) => new Promise((_resolve, reject) => { started(); signal.addEventListener('abort', () => reject(signal.reason), { once: true }); }) } });
@@ -105,7 +146,7 @@ test('只有方向未知的新消息也会暂停，保留待核对内容且不�
   const stored = JSON.parse(fs.readFileSync(path.join(f.directory, 'chat-watermarks.json'), 'utf8')).contacts[contact.id];
   assert.equal(stored.seen.includes('unknown-new'), false); assert.equal(stored.pending.phase, 'unclassified');
 });
-test('图片和语音等非文本消息只记录跳过，不调用模型或假装已理解', async (t) => {
+test('适配器明确标成未支持的附件只记录跳过，不调用模型或假装已理解', async (t) => {
   const f = fixture(t); await prepare(f); f.messages.push({ ...message('picture-new', '[图片]'), kind: 'image', unsupported: true }); await f.service.poll();
   assert.equal(f.inputs.length, 0); assert.equal(f.sent.length, 0); assert.equal(f.service.state().contacts[0].status, 'ready');
   assert.ok(f.service.state().events.some((item) => item.type === 'message.unsupported'));
@@ -129,7 +170,7 @@ test('旧窗口与历史分类只更新水位，不暂停、不进入后续新�
 test('跨进程仅一个回复 worker；另一个入口可按当前 runId 请求停止，旧请求不影响新一轮', async (t) => {
   const f = fixture(t); await f.service.configure({ recipientIds: [contact.id] });
   const moduleUrl = new URL('../chat-service.mjs', import.meta.url).href;
-  const script = `import { ChatService } from ${JSON.stringify(moduleUrl)}; const contact=${JSON.stringify(contact)};const service=new ChatService({config:${JSON.stringify(config)},stateDir:${JSON.stringify(f.directory)},agent:{replyTokens:512,reply:async()=>({text:'合成回复'})},browser:{listContacts:async()=>({contacts:[contact]}),readConversation:async(id)=>({conversation:{id},messages:[]}),sendMessage:async()=>({confirmed:true})}});await service.start({schedule:false});process.send({ready:true});process.on('message',async()=>{await service.close();process.exit(0)});`;
+  const script = `import { ChatService } from ${JSON.stringify(moduleUrl)}; const contact=${JSON.stringify(contact)};const service=new ChatService({config:${JSON.stringify(config)},stateDir:${JSON.stringify(f.directory)},agent:{replyTokens:512,reply:async()=>({text:'合成回复'})},browser:{listContacts:async()=>({contacts:[contact]}),readConversation:async(id)=>({conversation:{id},contact:{...contact},messages:[]}),sendMessage:async()=>({confirmed:true})}});await service.start({schedule:false});process.send({ready:true});process.on('message',async()=>{await service.close();process.exit(0)});`;
   const child = spawn(process.execPath, ['--input-type=module','-e',script], { stdio: ['ignore','ignore','pipe','ipc'], windowsHide: true });
   t.after(async () => { if (child.exitCode === null) { const ended = once(child, 'exit'); child.send('退出'); await ended; } });
   const [ready] = await once(child, 'message'); assert.equal(ready.ready, true);
@@ -143,7 +184,7 @@ test('跨进程仅一个回复 worker；另一个入口可按当前 runId 请求
 test('私信模型请求格式只含本会话消息，关闭工具与推理；拒绝截断或现实承诺', async () => {
   const requests = [];
   const agent = new ChatAgent({ config, fetchImpl: async (_url, options) => { requests.push(JSON.parse(options.body)); return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '你好，收到你的消息了。' } }] })); } });
-  assert.equal((await agent.reply({ messages: [message('one', '你好')] })).text, '[自动回复] 你好，收到你的消息了。');
+  assert.equal((await agent.reply({ messages: [message('one', '你好')] })).text, '你好，收到你的消息了。');
   assert.equal(requests[0].max_tokens, 512); assert.equal(requests[0].thinking.type, 'disabled'); assert.equal(requests[0].tools, undefined); assert.equal(JSON.stringify(requests[0]).includes(config.apiKey), false);
   for (const value of [{ finish_reason: 'length', message: { content: '截断' } }, { message: { content: '未给结束状态' } }, { finish_reason: 'stop', message: { content: '我会帮你转账。' } }]) {
     const bad = new ChatAgent({ config, fetchImpl: async () => new Response(JSON.stringify({ choices: [value] })) }); await assert.rejects(bad.reply({ messages: [message('one', '你好')] }));
@@ -159,7 +200,8 @@ test('重新启动保留模型失败的待答记录，明确设为基线跳过�
 test('配置回读等待期间另一个入口启动时不能覆盖正在运行的白名单', async (t) => {
   const f = fixture(t); await f.service.configure({ recipientIds: [contact.id] }); let release;
   const waiting = new Promise((resolve) => { release = resolve; }); const other = new ChatService({ config, agent: f.agent, stateDir: f.directory, browser: { ...f.browser, listContacts: async () => waiting } });
-  t.after(() => other.close()); const changing = other.configure({ recipientIds: ['synthetic-new'] }); await f.service.start({ schedule: false }); release({ contacts: [{ ...contact, id: 'synthetic-new' }] }); await assert.rejects(changing, /另一个入口/);
+  const replacement = { ...contact, id: `conv:${'3'.repeat(64)}`, identityHash: '3'.repeat(64), identityBinding: `binding:${'4'.repeat(64)}` };
+  t.after(() => other.close()); const changing = other.configure({ recipientIds: [replacement.id] }); await f.service.start({ schedule: false }); release({ contacts: [replacement] }); await assert.rejects(changing, /另一个入口/);
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.directory, 'chat-policy.json'), 'utf8')).allowlist[0].id, contact.id);
 });
 test('启动基线接受外部停止信号，完成后回复服务不绑定普通任务信号', async (t) => {
@@ -172,7 +214,7 @@ test('两个真实 Node 入口同时恢复死 worker 时仅一个取得新锁，
   const dead = spawn(process.execPath, ['-e', 'process.exit(0)'], { windowsHide: true, stdio: 'ignore' }); await once(dead, 'exit');
   assert.throws(() => process.kill(dead.pid, 0));
   const moduleUrl = new URL('../chat-service.mjs', import.meta.url).href;
-  const script = `import {ChatService} from ${JSON.stringify(moduleUrl)};const contact=${JSON.stringify(contact)};const service=new ChatService({config:${JSON.stringify(config)},stateDir:${JSON.stringify(f.directory)},agent:{replyTokens:512,reply:async()=>({text:'合成回复'})},browser:{listContacts:async()=>({contacts:[contact]}),readConversation:async(id)=>({conversation:{id},messages:[]}),sendMessage:async()=>{throw new Error('本测试禁止发送')}}});process.on('message',async command=>{if(command==='start'){try{await service.start({schedule:false});process.send({ok:true,pid:process.pid,runId:service.runId})}catch(error){process.send({ok:false,message:error.message})}}else{await service.close();process.exit(0)}});process.send({ready:true});`;
+  const script = `import {ChatService} from ${JSON.stringify(moduleUrl)};const contact=${JSON.stringify(contact)};const service=new ChatService({config:${JSON.stringify(config)},stateDir:${JSON.stringify(f.directory)},agent:{replyTokens:512,reply:async()=>({text:'合成回复'})},browser:{listContacts:async()=>({contacts:[contact]}),readConversation:async(id)=>({conversation:{id},contact:{...contact},messages:[]}),sendMessage:async()=>{throw new Error('本测试禁止发送')}}});process.on('message',async command=>{if(command==='start'){try{await service.start({schedule:false});process.send({ok:true,pid:process.pid,runId:service.runId})}catch(error){process.send({ok:false,message:error.message})}}else{await service.close();process.exit(0)}});process.send({ready:true});`;
   for (let round = 0; round < 4; round++) {
     fs.writeFileSync(path.join(f.directory, 'chat-loop.lock'), JSON.stringify({ pid: dead.pid, runId: `dead-fixture-${round}`, heartbeatAt: '2000-01-01T00:00:00Z', status: 'running' }));
     const children = Array.from({ length: 2 }, () => spawn(process.execPath, ['--input-type=module', '-e', script], { windowsHide: true, stdio: ['ignore','ignore','pipe','ipc'] }));

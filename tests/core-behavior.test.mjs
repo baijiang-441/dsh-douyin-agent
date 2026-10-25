@@ -17,9 +17,9 @@ function fixture(t, { source = 'api', captureSeconds = 3, persistenceSeconds = 0
   const advance = (seconds, { progress = seconds, paused = false, change = false } = {}) => { now += seconds * 1000; current.video.time += progress; current.video.paused = paused; if (change) changeVideo(); };
   if (persistenceSeconds) { const recordObservation = personaMemory.recordObservation.bind(personaMemory); personaMemory.recordObservation = (...args) => { const receipt = recordObservation(...args); advance(persistenceSeconds); return receipt; }; }
   let clicks = 0;
-  const arrow = { filter: () => arrow, count: async () => 1, first: () => arrow, click: async () => { clicks++; changeVideo(); } };
+  const arrow = { filter: () => arrow, count: async () => 1, first: () => arrow, isVisible:async()=>true,isEnabled:async()=>true,evaluate:async reader=>reader.toString().includes('getBoundingClientRect')?{x:400,y:100,width:70,height:40,clickX:435,clickY:120}:undefined };
   const controller = Object.create(BrowserController.prototype);
-  Object.assign(controller, { source, state: async () => structuredClone(current), checkVideoLimits: async () => {}, getPersonaMemory: () => personaMemory, page: { locator: () => arrow, screenshot: async () => { advance(captureSeconds); return Buffer.from([255, 216, 255, 217]); } } });
+  Object.assign(controller, { source, state: async () => structuredClone(current), checkVideoLimits: async () => {}, getPersonaMemory: () => personaMemory, page: { locator: () => arrow, evaluate:async reader=>reader.toString().includes('return{blocked:')?{blocked:false,dispatched:true}:true,mouse:{click:async()=>{clicks++;changeVideo();}}, screenshot: async () => { advance(captureSeconds); return Buffer.from([255, 216, 255, 217]); } } });
   t.after(() => { assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep)); fs.rmSync(root, { recursive: true, force: true }); });
   return { root, personaMemory, controller, advance, initialAt, clicks: () => clicks, snapshot: () => personaMemory.snapshot(), records: () => JSON.parse(fs.readFileSync(personaMemory.stateFile, 'utf8')) };
 }

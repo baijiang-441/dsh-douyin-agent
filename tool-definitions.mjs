@@ -68,17 +68,17 @@ export const TOOL_DEFINITIONS = [
     name:'douyin_chat_observe',description:'读取许可名单内指定表情或分享卡片的实际画面；分享视频只在允许的刷视频时间内采样，不能把封面当成看完整条作品。',
     parameters:{type:'object',properties:{recipientId:{type:'string',minLength:1,maxLength:500},messageId:{type:'string',minLength:1,maxLength:80}},required:['recipientId','messageId'],additionalProperties:false},
   },
-  {name:'douyin_video_limits_status',description:'读取自定义刷视频时间段、单轮时长及剩余时间。开始新一轮只能由用户在控制台或CLI操作。',parameters:empty()},
+  {name:'douyin_video_limits_status',description:'读取允许观看开关、自定义时间段、当天已用观看时间和模型请求额度。',parameters:empty()},
   {name:'douyin_media_status',description:'读取可选音频能力的开关、后端及依赖状态；默认关闭，不返回任何密钥。',parameters:empty()},
   {name:'douyin_listen',description:'在音频开关开启且刷视频时间允许时，录取当前抖音视频最多10秒实际音轨并转写。不会录麦克风或其他程序声音。',parameters:{type:'object',properties:{seconds:{type:'number',minimum:1,maximum:10,description:'录取秒数，默认8，范围1至10。'}},additionalProperties:false}},
   {name:'douyin_forward_video',description:'为用户明确选择的好友转发当前作品或公开作品链接。实际发送由本机转发按钮的可信授权入口执行，自动回复和普通视频模型不能发起转发。',parameters:{type:'object',properties:{recipientId:{type:'string',minLength:1,maxLength:500},url:{type:'string',maxLength:1000}},required:['recipientId'],additionalProperties:false}},
   {name:'douyin_persona_status',description:'读取软件与插件共用的最新大肥鱼人格卡、自己的兴趣和有来源的观看记录。人格与记忆不授予额外工具权限。',parameters:empty()},
   {name:'douyin_interest_record',description:'根据真实观看进度、持续停留、跳过和已确认互动更新大肥鱼自己的兴趣。画面主题仅为提案，没有行为依据保持待观察；必须使用宿主证据ID，不得把用户偏好、私信或QQ内容写成自己的兴趣。',parameters:{type:'object',properties:{evidenceId:{type:'string',maxLength:90},topic:{type:'string',maxLength:80},signal:{type:'string',enum:['like','dislike','neutral']},reflection:{type:'string',maxLength:600}},required:['evidenceId','topic','signal','reflection'],additionalProperties:false}},
-  {name:'douyin_watch_status',description:'读取两入口共用的自主观看状态、当前有限轮次与模型请求预算。不会开始观看。',parameters:empty()},
-  {name:'douyin_watch_start',description:'仅在用户明确要求自主观看时，使用已开始且尚未到期的有限视频轮次，按共用人格与兴趣挑片并更新偏好。不能新开或延长一轮，不点赞或发文字私信；仅在用户开启自主评论且预算允许时可以评论当前作品；只有用户开启自主分享时才可在既有许可名单中自行挑人分享当前观察作品。',parameters:{type:'object',properties:{maxRequests:{type:'integer',minimum:1,maximum:10000,description:'本轮自主决策请求上限，默认30，停止再开始不会重置。'}},additionalProperties:false}},
+  {name:'douyin_watch_status',description:'读取两入口共用的自主观看状态、今日观看时间、请求次数和停止原因。不会开始观看。',parameters:empty()},
+  {name:'douyin_watch_start',description:'仅在用户已开启允许观看且时段和每日额度允许时，按共用人格与兴趣挑片并更新偏好。不能改变用户许可或每日上限，不点赞或发文字私信；仅在用户开启自主评论且预算允许时可以评论当前作品；只有用户开启自主分享时才可在既有许可名单中自行挑人分享当前观察作品。',parameters:{type:'object',properties:{maxRequests:{type:'integer',minimum:1,description:'旧版兼容参数；当前使用设置页中共用的每日请求上限，不能通过本参数改变额度。'}},additionalProperties:false}},
   {name:'douyin_watch_stop',description:'按用户要求停止自主观看并暂停视频，不结束或重启其他服务。',parameters:empty()},
   {name:'douyin_spark_status',description:'只读自动续火花问候的许可、时段、每日预算、已有互动与待核对收据。消息送达不代表平台火花已增加。',parameters:empty()},
-  {name:'douyin_spark_start',description:'仅在用户已保存续火花总许可并明确要求启动时，开始有限时段内的人格问候调度。沿用两位许可好友，每好友每天最多一次；已有当天互动跳过，不能修改许可、时段或次数。',parameters:empty()},
+  {name:'douyin_spark_start',description:'自动续火花功能已移除。此旧版兼容入口始终拒绝启动；好友互动使用统一总开关。',parameters:empty()},
   {name:'douyin_spark_stop',description:'按用户要求停止自动续火花问候，取消尚未发出的问候，保留发送核对记录，不停止视频或自动回复。',parameters:empty()},
   {name:'douyin_report_status',description:'只读共享视频日报目录与已有报告摘要，不开始观看或调用模型。',parameters:empty()},
   {name:'douyin_report_generate',description:'按已留存的实际视频观察与行为证据生成今日Markdown日报，不增加浏览或模型请求，不读取人格正文、私信或QQ。',parameters:empty()},
@@ -105,7 +105,7 @@ export function validateToolArguments(definition, args) {
   }
   if (args.seconds !== undefined && (args.seconds < 1 || args.seconds > 10)) throw new RangeError('观察时间须在 1 到 10 秒之间。');
   if (args.limit !== undefined && (args.limit < 1 || args.limit > 20)) throw new RangeError('返回条数须在 1 到 20 之间。');
-  if (args.maxRequests !== undefined && (args.maxRequests < 1 || args.maxRequests > 10000)) throw new RangeError('自主观看请求上限须为 1 至 10000。');
+  if (args.maxRequests !== undefined && args.maxRequests < 1) throw new RangeError('请求上限须为正安全整数。');
   if (definition.name === 'douyin_diagnostics_repair' && (!/^[a-f0-9-]{36}$/.test(args.reportId) || args.action !== 'reapply_silent')) throw new TypeError('须使用自检返回的报告编号及允许动作。');
   if (definition.name === 'douyin_interest_record' && (!args.evidenceId.trim() || !args.topic.trim() || !args.reflection.trim() || !['like','dislike','neutral'].includes(args.signal))) throw new TypeError('兴趣更新需要真实证据、主题、有效倾向与简短理由。');
   if(definition.name==='douyin_chat_observe' && !/^msg:[a-f0-9]{64}$/.test(args.messageId)) throw new TypeError('需要已读取的精确消息ID。');

@@ -1,5 +1,6 @@
 import brandIcon from '../../../assets/brand.png';
-import { SchedulePanel, InteractionStatus, UpdateDialog } from './autonomy-panels.jsx';
+import { canAuthorizeConversation, hasStableConversationIdentity, matchesAuthorizedContact } from '../../../contact-authorization.mjs';
+import { UpdateDialog } from './autonomy-panels.jsx';
 import { SETTINGS_SECTIONS } from '../../../settings-sections.mjs';
 import { HealthDashboard, TopicPanel } from './health-dashboard.jsx';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -13,15 +14,15 @@ import '@dsh/theme/scrollbar.css';
 import '@dsh/theme/gradient-shadow-text.css';
 import '@dsh/theme/shiki.css';
 import './style.css';
-import { createApiClient, publicSettings, saveNativeSettings, saveNativeMediaKey, createForwardGate, mergeEvents, watchIsActive } from './api.mjs';
-import { WatchControls, WatchView, PersonaPanel } from './watch-persona.jsx';
+import { createApiClient, publicSettings, saveNativeSettings, saveNativeMediaKey, createForwardGate, mergeEvents, watchIsActive, requestFailure, operationLabel } from './api.mjs';
+import { WatchView, PersonaPanel } from './watch-persona.jsx';
 import { TaskBudgetPanel } from './task-budget.jsx';
-import { AutoSharePanel } from './autonomous-share.jsx';
-import { SparkPanel } from './spark-panel.jsx';
+import { ShareReceipts } from './autonomous-share.jsx';
+import { useAutoSave, AutoSaveStatus } from './use-auto-save.jsx';
 import { SilentPanel, CommentsPanel, ReportsView } from './watch-settings.jsx';
 
 const MARKDOWN_LABELS = { code: { copyLabel: '复制代码', copiedLabel: '已复制' }, footnotes: '注释' };
-const EVENT_LABELS = { 'model.request': '请求模型', 'model.usage': '本次用量', 'model.answer': '模型答复', 'tool.start': '调用工具', 'tool.result': '工具返回', 'tool.error': '工具出错', 'task.started': '开始任务', 'task.completed': '任务完成', 'task.stopped': '任务停止', 'task.failed': '任务失败', 'task.limited': '达到限制', 'task.needs_user': '需要手动操作', 'video.started': '开始新一轮', 'video.limited': '视频时间已结束' };
+const EVENT_LABELS = { 'model.request': '请求模型', 'model.usage': '本次用量', 'model.answer': '模型答复', 'tool.start': '调用工具', 'tool.result': '工具返回', 'tool.error': '工具出错', 'task.started': '开始任务', 'task.completed': '任务完成', 'task.stopped': '任务停止', 'task.failed': '任务失败', 'task.limited': '达到限制', 'task.needs_user': '需要手动操作', 'video.started': '开始观看', 'video.limited': '视频时间已结束' };
 const EXAMPLES = [['看推荐', '看看当前推荐视频，观察 3 秒，告诉我画面里发生了什么。'], ['搜索猫咪', '搜索猫咪，打开第一条作品并观察 3 秒，告诉我实际看到了什么。'], ['下一条', '切换下一条视频，读回切换是否成功，再观察 3 秒。'], ['上一条', '切换上一条视频，读回切换是否成功。'], ['暂停', '暂停当前视频，确认播放状态。'], ['播放', '播放当前视频，确认播放进度。']];
 const truncated = total => `内容较长，当前展示前 20000 字符（共 ${total} 字符）。`;
 const contactName = contact => contact?.name || contact?.displayName || '联系人';
@@ -32,93 +33,154 @@ function Panel({ title, badge, children }) { return <section className="panel"><
 function Note({ children, error = false }) { return <p className={error ? 'notice error' : 'notice'} role={error ? 'alert' : undefined}>{children}</p>; }
 function Data({ label = '查看返回数据', value }) { return <JsonBlock label={label} payload={value} truncatedLabel={truncated} />; }
 
-function ApiSettings({ settings, bridge, onSaved, onClose, run, busy, operationActive, watchActive, onStopWatch, onOpenDouyin, openingDouyin, connected, operationError }) {
-  const [key, setKey] = useState(''), [baseUrl, setBase] = useState(settings.baseUrl), [model, setModel] = useState(settings.model), [remember, setRemember] = useState(settings.remember);
-  const [failure, setFailure] = useState('');
-  const dirty = useRef(false);
-  useEffect(() => { if (!dirty.current) { setBase(settings.baseUrl); setModel(settings.model); setRemember(settings.remember); } }, [settings.baseUrl, settings.model, settings.remember]);
-  async function save(event) {
-    event.preventDefault(); if ((!settings.configured && !key.trim()) || busy || operationActive) return;
-    const input = { apiKey: key.trim(), baseUrl: baseUrl.trim(), model: model.trim(), remember }; setKey(''); setFailure('');
-    try { const result = await saveNativeSettings(bridge, input); await onSaved(result); }
-    catch { setFailure('设置未保存，请检查 API Key、接口地址和模型名称后重试。'); }
-    finally { input.apiKey = ''; }
+function contactPermissionLabel(contact, state, draft, status) {
+  const saved = state?.policy?.allowlist?.find(item => item.id === contact.id), selected = draft.recipientIds.includes(contact.id);
+  const matches = hasStableConversationIdentity(saved) && hasStableConversationIdentity(contact) && matchesAuthorizedContact(saved, contact);
+  if (selected && matches) return '已许可';
+  if (selected) return status.kind === 'saving' ? '正在保存许可' : status.kind === 'error' ? '许可未保存' : status.kind === 'saved' ? '许可已提交，等待回读' : '许可待保存';
+  if (saved) return status.kind === 'saving' ? '正在取消许可' : '许可待取消';
+  return contact.followed === true && contact.isGroup === false ? '尚未许可' : '需本人核对授权';
+}
+
+function FriendPresence({ presence, connected, onOpen }) {
+  const current = connected ? presence : null, label = current?.label || '状态待核实', reason = current?.reason || '正在读取好友回复服务状态。';
+  return <div className="friend-presence" role="status" aria-live="polite" title={reason} style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+    <Button size="sm" variant="outline" aria-label="查看好友互动状态" title={reason} onClick={onOpen}>{current?.online === true ? '●' : '○'} {label}</Button>
+    {['attention', 'preparing'].includes(current?.status) && <small role={current.status === 'attention' ? 'alert' : 'status'} style={{ maxWidth: 220, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{reason}</small>}
+  </div>;
+}
+
+function ApiSettings({ settings, bridge, onSaved, onClose, run, busy, operationActive, onOpenDouyin, openingDouyin, connected, operationError }) {
+  const [draft, setDraft] = useState({ apiKey: '', baseUrl: settings.baseUrl, model: settings.model, remember: settings.remember }), [failure, setFailure] = useState(''), [notice, setNotice] = useState('');
+  const current = useRef(draft), version = useRef(0), dirty = useRef(false), writing = useRef(false), queued = useRef(false);
+  useEffect(() => { if (!dirty.current) { const next = { apiKey: '', baseUrl: settings.baseUrl, model: settings.model, remember: settings.remember }; current.current = next; setDraft(next); } }, [settings.baseUrl, settings.model, settings.remember]);
+  function edit(patch) { version.current++; dirty.current = true; current.current = { ...current.current, ...patch }; setDraft(current.current); setFailure(''); setNotice('离开输入框后自动保存。'); }
+  async function save() {
+    if (!dirty.current || (!settings.configured && !current.current.apiKey.trim()) || operationActive || !bridge?.saveSettings) return;
+    if (writing.current) { queued.current = true; return; }
+    const input = { ...current.current, apiKey: current.current.apiKey.trim(), baseUrl: current.current.baseUrl.trim(), model: current.current.model.trim() };
+    if (!input.baseUrl || !input.model) { setNotice('请填写完整接口地址和模型名称。'); return; }
+    writing.current = true; queued.current = false; const submitted = version.current; setFailure(''); setNotice('正在保存…');
+    try { const result = await saveNativeSettings(bridge, input); if (version.current === submitted) { dirty.current = false; current.current = { ...current.current, apiKey: '' }; setDraft(current.current); } await onSaved(result); setNotice('模型设置已生效。'); }
+    catch (error) { setNotice(''); setFailure(`${error.message || '模型设置未保存。'} 输入已保留。`); }
+    finally { input.apiKey = ''; writing.current = false; if (queued.current) { queued.current = false; void save(); } }
   }
   return <div className="settings-scrim"><section className="api-dialog" role="dialog" aria-modal="true" aria-labelledby="api-title">
     <div className="brand-icon"><img src={brandIcon} alt="大肥鱼图标" /></div><h1 id="api-title">{settings.configured ? '模型与共享记忆' : '先连接你的 DeepSeek'}</h1>
-    <p className="muted">输入 API Key 后即可使用。软件独立运行，不需要启动 DSH。</p>
+    <p className="muted">填写后离开输入框即可保存。软件独立运行，不需要启动 DSH。</p>
     <Button size="sm" variant="outline" onClick={onOpenDouyin} disabled={!connected || openingDouyin}>{openingDouyin ? '正在打开抖音…' : '打开抖音'}</Button>
-    <p className="notice">可先打开专用抖音窗口登录。打开页面不开始视频计时。</p>
-    {operationError && <Note error>{operationError}</Note>}
-    {operationActive && <Note>请先停止正在执行的任务、自主观看、自动回复、主动问候或转发，再修改模型设置。{watchActive && <Button size="sm" onClick={onStopWatch}>停止当前自主观看</Button>}</Note>}
-    <form onSubmit={event => { void run('settings', () => save(event)); }}>
-      <Field title="API Key" hint="通过桌面进程交给模型接口，本机 HTTP 接口不接收或返回密钥。"><Input aria-label="API Key" type="password" autoComplete="off" value={key} onChange={event => setKey(event.target.value)} maxLength={4096} required={!settings.configured} placeholder={settings.configured ? '留空沿用现有 API Key' : ''} autoFocus /></Field>
-      <details className="advanced"><summary>接口与模型</summary><Field title="API 地址"><Input aria-label="API 地址" value={baseUrl} onChange={event => { dirty.current = true; setBase(event.target.value); }} required /></Field><Field title="模型名称"><Input aria-label="模型名称" value={model} onChange={event => { dirty.current = true; setModel(event.target.value); }} maxLength={120} required /></Field></details>
-      <div className="switch-row"><div><strong>记住 API Key</strong><small>关闭后仅在本次运行中使用。</small></div><Switch label="记住 API Key" checked={remember} onChange={value => { dirty.current = true; setRemember(value); }} /></div>
-      {failure && <Note error>{failure}</Note>}
-      <div className="actions"><Button type="submit" variant="primary" disabled={operationActive || (!settings.configured && !key.trim()) || busy || !bridge?.saveSettings}>{busy ? '正在保存…' : settings.configured ? '保存设置' : '保存并连接'}</Button>{settings.configured && <Button onClick={onClose}>返回</Button>}</div>
-    </form>
-    {settings.configured && <Button size="sm" onClick={() => { if (!operationActive) void run('clearKey', async () => onSaved(publicSettings(await bridge.clearApiKey()))); }} disabled={busy || operationActive}>清除已保存的 API Key</Button>}
-    <div className="memory-location"><strong>与插件共用的记忆文件夹</strong><code>{settings.memoryFolder || '正在读取文件夹位置…'}</code><Button size="sm" variant="outline" disabled={!bridge?.openMemoryFolder || !settings.memoryFolder} onClick={() => { void run('openMemory', () => bridge.openMemoryFolder()); }}>打开记忆文件夹</Button><small>独立软件与抖音插件读取同一位置。</small></div>
-    {!bridge && <Note error>桌面设置接口未连接，请从独立软件打开此界面。</Note>}
+    {operationError && <Note error>{operationError}</Note>}{operationActive && <Note>请先结束当前任务或等待互动处理完成。自主观看运行时，请先关闭允许自动观看。</Note>}
+    <Field title="API Key" hint="Key 只通过桌面进程保存，不进入本机 HTTP 请求。"><Input aria-label="API Key" type="password" autoComplete="off" value={draft.apiKey} onChange={event => edit({ apiKey: event.target.value })} onBlur={() => { void save(); }} maxLength={4096} disabled={operationActive} placeholder={settings.configured ? '留空沿用现有 API Key' : ''} autoFocus /></Field>
+    <details className="advanced"><summary>接口与模型</summary><Field title="API 地址"><Input aria-label="API 地址" value={draft.baseUrl} disabled={operationActive} onChange={event => edit({ baseUrl: event.target.value })} onBlur={() => { void save(); }} /></Field><Field title="模型名称"><Input aria-label="模型名称" value={draft.model} maxLength={120} disabled={operationActive} onChange={event => edit({ model: event.target.value })} onBlur={() => { void save(); }} /></Field></details>
+    <div className="switch-row"><div><strong>记住 API Key</strong><small>关闭后仅在本次运行中使用。</small></div><Switch label="记住 API Key" checked={draft.remember} disabled={operationActive} onChange={value => { edit({ remember: value }); void save(); }} /></div>
+    {failure && <Note error>{failure}</Note>}{notice && <p role="status">{notice}</p>}
+    {settings.configured && <div className="actions"><Button onClick={onClose}>返回</Button><Button size="sm" disabled={busy || operationActive} onClick={() => { void run('clearKey', async () => onSaved(publicSettings(await bridge.clearApiKey()))); }}>清除已保存的 API Key</Button></div>}
+    <div className="memory-location"><strong>与插件共用的记忆文件夹</strong><code>{settings.memoryFolder || '正在读取文件夹位置…'}</code><Button size="sm" variant="outline" disabled={!bridge?.openMemoryFolder || !settings.memoryFolder} onClick={() => { void run('openMemory', () => bridge.openMemoryFolder()); }}>打开记忆文件夹</Button></div>
   </section></div>;
 }
 
-function VideoPanel({ state, api, run, busy, children }) {
-  const [windows, setWindows] = useState('00:00-24:00'), [minutes, setMinutes] = useState(10), [unlimited, setUnlimited] = useState(false), [weekendAll, setWeekendAll] = useState(false), dirty = useRef(false);
-  useEffect(() => { if (state?.policy && !dirty.current) { setWindows(state.policy.windows.join('\n')); setMinutes(state.policy.sessionMinutes ?? 10); setUnlimited(state.policy.sessionMinutes === null); setWeekendAll(state.policy.weekendWindows?.join() === '00:00-24:00'); } }, [state]);
-  return <Panel title="刷视频时间" badge={<Tag>{state?.allowed ? state.remainingSeconds === null ? '不限时长' : `${Math.floor((state.remainingSeconds || 0) / 60)}分${(state.remainingSeconds || 0) % 60}秒` : '未开始'}</Tag>}>
-    <form onSubmit={event => { event.preventDefault(); void run('videoPolicy', async () => { await api('/api/video/policy', { windows: windows.split(/[\n,;，；]+/).map(item => item.trim()).filter(Boolean), weekendWindows: weekendAll ? ['00:00-24:00'] : null, sessionMinutes: unlimited ? null : Number(minutes) }); dirty.current = false; }); }}>
-      <div className="actions"><Button size="sm" type="button" onClick={() => { dirty.current = true; setWindows('00:00-09:00\n12:00-14:00\n18:00-24:00'); setWeekendAll(true); }}>谷时段（DeepSeek）</Button><Button size="sm" type="button" onClick={() => { dirty.current = true; setWindows('00:00-24:00'); setWeekendAll(false); }}>全天</Button><Button size="sm" type="button" onClick={() => { dirty.current = true; setWindows('20:00-22:00'); setWeekendAll(false); }}>晚间 20–22 点</Button></div><p className="notice">谷时段按 DeepSeek 2026-10-23 官方规则；周末全天，法定节假日可手动改为全天。其他提供商优惠以其规则为准。填入后请保存。</p>
-      <div className="switch-row"><span>周末全天允许</span><Switch label="周末全天允许" checked={weekendAll} onChange={checked => { dirty.current = true; setWeekendAll(checked); }} /></div>
-      <div className="switch-row"><span>不限单轮时长</span><Switch label="不限单轮时长" checked={unlimited} onChange={checked => { dirty.current = true; setUnlimited(checked); }} /></div>
-      <Field title="每日允许时段 · 北京时间"><textarea aria-label="每日允许时段" rows={2} value={windows} maxLength={220} onChange={event => { dirty.current = true; setWindows(event.target.value); }} placeholder="20:00-21:00，每行一段" required /></Field>
-      <Field title="单轮上限（分钟）" hint={unlimited ? '当前不限单轮时长。直接填写分钟数即可切回限时，点击“保存时间设置”后生效。' : '修改分钟数后，请点击“保存时间设置”。'}><Input aria-label="单轮上限" type="number" min={1} max={1000000} step={1} value={unlimited ? '' : minutes} placeholder={unlimited ? '不限；输入分钟数可设置上限' : '请输入分钟数'} onChange={event => { dirty.current = true; const value = event.target.value; setMinutes(value); if (value !== '') setUnlimited(false); }} required={!unlimited} /></Field>
-      <Button type="submit" size="sm" variant="outline" disabled={busy.has('videoPolicy')}>保存时间设置</Button>
-    </form>
-    <div className="actions"><Button size="sm" variant="primary" disabled={!state?.window || busy.has('videoStart')} onClick={() => { void run('videoStart', () => api('/api/video/start', {})); }}>开始新一轮</Button><Button size="sm" disabled={state?.session?.status !== 'active' || busy.has('videoEnd')} onClick={() => { void run('videoEnd', () => api('/api/video/end', {})); }}>结束本轮</Button></div>
-    <Note>{state?.reason || '本轮计时中，到点会暂停视频。'} 保存设置不会给当前轮次加时。</Note>
+function VideoPanel({ state, schedule, watch, api, run, busy, connected = true, configured = false, children }) {
+  const read = snapshot => {
+    const policy = snapshot?.policy || {}, minutes = Object.hasOwn(policy, 'dailyMinutes') ? policy.dailyMinutes : Object.hasOwn(policy, 'sessionMinutes') ? policy.sessionMinutes : 10, requests = Object.hasOwn(policy, 'dailyRequests') ? policy.dailyRequests : 30;
+    return { windows: (policy.windows || ['00:00-24:00']).join('\n'), weekendAll: policy.weekendWindows?.join() === '00:00-24:00', dailyMinutes: minutes ?? '', unlimitedMinutes: minutes === null, dailyRequests: requests ?? '', unlimitedRequests: requests === null };
+  };
+  const encode = draft => {
+    const windows = draft.windows.split(/[\n,;，；]+/).map(item => item.trim()).filter(Boolean);
+    if (!windows.length || windows.some(item => !/^\d{2}:\d{2}-\d{2}:\d{2}$/.test(item))) throw new Error('时段请填写完整的 HH:MM-HH:MM。');
+    const number = (value, unlimited, label) => { if (unlimited) return null; const result = Number(value); if (String(value).trim() === '' || !Number.isSafeInteger(result) || result < 1) throw new Error(`${label}请填写正整数，或选择不限。`); return result; };
+    return { windows, weekendWindows: draft.weekendAll ? ['00:00-24:00'] : null, dailyMinutes: number(draft.dailyMinutes, draft.unlimitedMinutes, '每日观看分钟数'), dailyRequests: number(draft.dailyRequests, draft.unlimitedRequests, '每日模型请求次数') };
+  };
+  const form = useAutoSave({ value: state, initial: read(null), read, encode, write: payload => api('/api/video/policy', payload), canonical: (saved, payload) => saved?.policy ? encode(read(saved)) : payload, available: connected });
+  const { draft, edit } = form;
+  const [toggleStatus, setToggleStatus] = useState(''), [toggleError, setToggleError] = useState('');
+  const changing = useRef(false), pending = useRef(null), enabled = schedule?.policy?.enabled === true;
+  const watchReady = connected && typeof schedule?.policy?.enabled === 'boolean' && typeof watch?.running === 'boolean', watching = watchIsActive(watch);
+  useEffect(() => { if (pending.current !== null && enabled === pending.current) { pending.current = null; setToggleStatus('自动观看设置已生效。'); } }, [enabled]);
+  async function toggle(value) {
+    if (changing.current) return; changing.current = true; pending.current = value; setToggleError(''); setToggleStatus('正在更新自动观看…');
+    try { const saved = await api('/api/watch/schedule', { enabled: value }); if (saved?.policy?.enabled === value) { pending.current = null; setToggleStatus(value ? '已允许观看，正在检查时段和每日预算。' : '已暂停观看。'); } else setToggleStatus('已提交，等待状态同步。'); }
+    catch (error) { pending.current = null; setToggleStatus(''); setToggleError(error.message || '自动观看设置未生效。'); }
+    finally { changing.current = false; }
+  }
+  return <Panel title="视频观看" badge={<Tag>{watch?.running ? '正在观看' : enabled ? '等待允许时段' : '已关闭'}</Tag>}>
+    <div className="switch-row"><span>允许自动观看</span><Switch label="允许自动观看" checked={enabled} disabled={!connected || typeof schedule?.policy?.enabled !== 'boolean' || changing.current} onChange={value => { void toggle(value); }} /></div>
+    <p className="notice">开启后，在允许时段内自动观看；离开时段或用完每日预算会停止。应用需保持运行。</p>
+    <div className="actions"><Button size="sm" variant="primary" disabled={!watchReady || !configured || watching || schedule?.busy || changing.current} onClick={() => { void toggle(true); }}>开始自主观看</Button><Button size="sm" variant="outline" disabled={!watchReady || !enabled && !watching && !schedule?.busy || changing.current} onClick={() => { void toggle(false); }}>暂停观看</Button></div>
+    <p className="notice">不在允许时段会等待；按钮与开关共用设置，每日已用时长和模型次数不会重置。</p>
+    {toggleStatus && <p role="status">{toggleStatus}</p>}{toggleError && <Note error>{toggleError}</Note>}
+    <div className="actions"><Button size="sm" type="button" onClick={() => edit({ windows: '00:00-09:00\n12:00-14:00\n18:00-24:00', weekendAll: true }, { immediate: true })}>谷时段（DeepSeek）</Button><Button size="sm" type="button" onClick={() => edit({ windows: '00:00-24:00', weekendAll: false }, { immediate: true })}>全天</Button><Button size="sm" type="button" onClick={() => edit({ windows: '20:00-22:00', weekendAll: false }, { immediate: true })}>晚间 20–22 点</Button></div>
+    <div className="switch-row"><span>周末全天允许</span><Switch label="周末全天允许" checked={draft.weekendAll} onChange={value => edit({ weekendAll: value }, { immediate: true })} /></div>
+    <Field title="每日允许时段 · 北京时间"><textarea aria-label="每日允许时段" rows={2} value={draft.windows} maxLength={220} onChange={event => edit({ windows: event.target.value })} /></Field>
+    <details><summary>高级选项</summary>
+      <div className="switch-row"><span>不限每日观看时长</span><Switch label="不限每日观看时长" checked={draft.unlimitedMinutes} onChange={value => edit({ unlimitedMinutes: value }, { immediate: true })} /></div>
+      <Field title="每日观看上限（分钟）"><Input aria-label="每日观看上限" type="number" min={1} step={1} value={draft.unlimitedMinutes ? '' : draft.dailyMinutes} placeholder={draft.unlimitedMinutes ? '不限；输入分钟数可设置上限' : '正整数分钟数'} onChange={event => edit({ dailyMinutes: event.target.value, ...(event.target.value !== '' ? { unlimitedMinutes: false } : {}) })} /></Field>
+      <div className="switch-row"><span>不限每日模型请求次数</span><Switch label="不限每日模型请求次数" checked={draft.unlimitedRequests} onChange={value => edit({ unlimitedRequests: value }, { immediate: true })} /></div>
+      <Field title="每日模型请求上限"><Input aria-label="每日观看模型请求上限" type="number" min={1} step={1} value={draft.unlimitedRequests ? '' : draft.dailyRequests} placeholder={draft.unlimitedRequests ? '不限；输入次数可设置上限' : '正整数次数'} onChange={event => edit({ dailyRequests: event.target.value, ...(event.target.value !== '' ? { unlimitedRequests: false } : {}) })} /></Field>
+    </details>
+    <AutoSaveStatus status={form.status} />
+    <Note>今日已观看 {Math.floor(state?.daily?.usedSeconds || 0)} 秒 · 已请求 {state?.daily?.requests || 0} 次模型。{state?.daily?.remainingSeconds === null ? '今日时长不限。' : Number.isFinite(state?.daily?.remainingSeconds) ? `今日剩余 ${Math.floor(state.daily.remainingSeconds)} 秒。` : ''}</Note>
+    {state?.reason && <Note>{state.reason}</Note>}{schedule?.lastError && <Note error>{schedule.lastError}</Note>}{watch?.lastError && <p role="status">上次自主观看停止原因：{watch.lastError}</p>}
     {children}
   </Panel>;
 }
 
 function AudioPanel({ state, api, run, busy, bridge, operationActive }) {
-  const [enabled, setEnabled] = useState(false), [backend, setBackend] = useState('local-whisper');
-  const [mediaKey, setMediaKey] = useState(''), [keyNote, setKeyNote] = useState('');
-  const dirty = useRef(false);
-  useEffect(() => { if (state && !dirty.current) { setEnabled(state.enabled === true); setBackend(state.backend); } }, [state]);
-  const info = state?.backends?.[backend] || state?.providers?.[backend];
-  return <Panel title="音频理解" badge={<Tag>{state?.enabled ? '已开启' : '默认关闭'}</Tag>}>
-    <div className="switch-row"><span>读取视频声音</span><Switch label="读取视频声音" checked={enabled} onChange={value => { dirty.current = true; setEnabled(value); }} /></div>
-    <Field title="音频后端"><select aria-label="音频后端" value={backend} onChange={event => { dirty.current = true; setBackend(event.target.value); setMediaKey(''); setKeyNote(''); }}><option value="local-whisper">本机 Whisper</option><option value="mimo">MiMo</option><option value="minimax">MiniMax</option></select></Field>
-    {backend !== 'local-whisper' && <form onSubmit={event => { event.preventDefault(); if (operationActive || !mediaKey.trim()) return; void run('mediaKey', async () => { await saveNativeMediaKey(bridge, { backend, apiKey: mediaKey }); setMediaKey(''); setKeyNote('已保存共享音频 Key。保存不会开启音频或发起云端请求。'); }); }}>
-      <Field title={`${backend === 'mimo' ? 'MiMo' : 'MiniMax'} API Key`} hint="保存在本机共享媒体 .env 中（明文），软件与插件共用；不回显已保存的 Key。"><Input aria-label={`${backend === 'mimo' ? 'MiMo' : 'MiniMax'} API Key`} type="password" autoComplete="off" maxLength={4096} value={mediaKey} onChange={event => { setMediaKey(event.target.value); setKeyNote(''); }} placeholder={info?.available ? '已配置；填写后替换' : '填写音频服务的 API Key'} /></Field>
-      <Button size="sm" type="submit" variant="outline" disabled={!bridge?.saveMediaKey || operationActive || busy.has('mediaKey') || !mediaKey.trim()}>{busy.has('mediaKey') ? '正在保存…' : '保存音频 Key'}</Button>
-      {!bridge?.saveMediaKey && <Note>此窗口不支持保存音频 Key，请使用新版软件，或在共享媒体 .env 填写 {backend === 'mimo' ? 'XIAOMI_API_KEY' : 'MINIMAX_API_KEY'}。</Note>}
-      {operationActive && <Note>停止当前任务、自主观看及自动回复后可更换音频 Key。</Note>}
-      {keyNote && <Note>{keyNote}</Note>}
-    </form>}
-    <div className="actions"><Button size="sm" variant="outline" disabled={busy.has('audioSave')} onClick={() => { void run('audioSave', async () => { await api('/api/media/configure', { enabled, backend }); dirty.current = false; }); }}>保存音频设置</Button><Button size="sm" onClick={() => { dirty.current = false; void run('audioRefresh', () => api('/api/media/state')); }}>刷新</Button></div>
-    <Note>{info?.available === true ? '后端依赖已就绪。' : info?.available === false ? '所选后端尚未就绪。' : '后端可用性尚未确认。'} 音频处理可能需要额外配置或费用。</Note>
+  const read = value => ({ enabled: value?.enabled === true, backend: value?.backend || 'local-whisper' });
+  const form = useAutoSave({ value: state, initial: read(null), read, encode: value => value, write: value => api('/api/media/configure', value), canonical: (saved, payload) => typeof saved?.enabled === 'boolean' ? read(saved) : payload, available: Boolean(state) });
+  const [mediaKey, setMediaKey] = useState(''), [keyNote, setKeyNote] = useState(''), [keyError, setKeyError] = useState('');
+  const keyValue = useRef(''), writing = useRef(false), backend = form.draft.backend, info = state?.backends?.[backend] || state?.providers?.[backend];
+  async function saveKey() {
+    if (operationActive || !keyValue.current.trim() || writing.current) return;
+    const secret = keyValue.current; writing.current = true; setKeyNote('正在保存…'); setKeyError('');
+    try { await saveNativeMediaKey(bridge, { backend, apiKey: secret }); if (keyValue.current === secret) { keyValue.current = ''; setMediaKey(''); } setKeyNote('共享音频 Key 已保存；不会自动开启音频。'); }
+    catch (error) { setKeyNote(''); setKeyError(`${error.message || 'Key 未保存。'} 输入已保留。`); }
+    finally { writing.current = false; }
+  }
+  return <Panel title="音频理解" badge={<Tag>{state?.enabled ? '已开启' : '已关闭'}</Tag>}>
+    <div className="switch-row"><span>读取视频声音</span><Switch label="读取视频声音" checked={form.draft.enabled} onChange={value => form.edit({ enabled: value }, { immediate: true })} /></div>
+    <Field title="音频后端"><select aria-label="音频后端" value={backend} onChange={event => { form.edit({ backend: event.target.value }, { immediate: true }); keyValue.current = ''; setMediaKey(''); setKeyNote(''); }}><option value="local-whisper">本机 Whisper</option><option value="mimo">MiMo</option><option value="minimax">MiniMax</option></select></Field>
+    <AutoSaveStatus status={form.status} />
+    {backend !== 'local-whisper' && <Field title={`${backend === 'mimo' ? 'MiMo' : 'MiniMax'} API Key`} hint="离开输入框后保存到本机共享媒体文件；不回显已有 Key。"><Input aria-label={`${backend === 'mimo' ? 'MiMo' : 'MiniMax'} API Key`} type="password" autoComplete="off" maxLength={4096} value={mediaKey} disabled={operationActive || !bridge?.saveMediaKey} onChange={event => { keyValue.current = event.target.value; setMediaKey(event.target.value); setKeyNote(''); }} onBlur={() => { void saveKey(); }} placeholder={info?.available ? '已配置；填写后替换' : '填写音频服务 API Key'} /></Field>}
+    {keyNote && <p role="status">{keyNote}</p>}{keyError && <Note error>{keyError}</Note>}
+    <Note>{info?.available === true ? '后端依赖已就绪。' : info?.available === false ? '所选后端尚未就绪。' : '后端可用性尚未确认。'}</Note>
   </Panel>;
 }
 
-function ChatPanel({ state, api, run, busy, configured }) {
-  const [contacts, setContacts] = useState(null), [chosen, setChosen] = useState([]), [budget, setBudget] = useState(40);
-  const active = state?.running || state?.starting || state?.busy;
-  useEffect(() => { if (!contacts) setChosen((state?.policy?.allowlist || []).map(item => item.id)); }, [state, contacts]);
-  useEffect(() => { if (state?.policy) setBudget(state.policy.dailyReplyLimit); }, [state?.policy?.dailyReplyLimit]);
-  async function load() { const value = await api('/api/chat/contacts'); if (value.blocked || value.loginRequired || value.verificationRequired) throw new Error('请在专用浏览器完成登录或验证。'); if (!value.contacts?.length) throw new Error('未读到可靠联系人列表，保留原许可名单。'); setContacts(value.contacts); }
-  return <Panel title="好友私信" badge={<Tag>{state?.running ? '运行中' : state?.starting ? '建立基线中' : '未启用'}</Tag>}>
-    <p className="muted">只回复你明确许可的两位已关注好友，启动前的历史不会触发回复。</p>
-    <Button size="sm" variant="outline" disabled={active || busy.has('chatList')} onClick={() => { void run('chatList', load); }}>读取联系人</Button>
-    <div className="contact-list">{contacts ? contacts.map(contact => <label key={contact.id}><input type="checkbox" checked={chosen.includes(contact.id)} disabled={active || contact.followed !== true || contact.isGroup !== false || (!chosen.includes(contact.id) && chosen.length >= 2)} onChange={event => setChosen(old => event.target.checked ? [...old, contact.id] : old.filter(id => id !== contact.id))} />{contactName(contact)}<small>{contact.followed === true && contact.isGroup === false ? '已关注' : '未通过身份核对'}</small></label>) : <p className="muted">已许可：{(state?.policy?.allowlist || []).map(contactName).join('、') || '尚未选择'}</p>}</div>
-    <Field title="每日模型请求上限"><Input aria-label="每日模型请求上限" type="number" min={1} max={200} value={budget} onChange={event => setBudget(event.target.value)} /></Field>
-    <div className="actions"><Button size="sm" disabled={!contacts || active || busy.has('chatSave')} onClick={() => { void run('chatSave', () => api('/api/chat/configure', { recipientIds: chosen, dailyReplyLimit: Number(budget) })); }}>保存许可名单</Button><Button size="sm" variant="primary" disabled={active || !configured || !state?.policy?.allowlist?.length || busy.has('chatStart')} onClick={() => { void run('chatStart', () => api('/api/chat/start', {})); }}>启用自动回复</Button><Button size="sm" disabled={!active && !state?.worker?.alive} onClick={() => { void run('chatStop', () => api('/api/chat/stop', {})); }}>停止</Button></div>
-    <Note>今日已请求 {state?.daily?.requests || 0} / {state?.daily?.limit || budget} 次。发送未确认时会暂停，不会自动重发。</Note>
-    {state?.worker?.alive && !state.worker.owned && <Note>自动回复正由另一个入口运行。</Note>}
-    {(state?.contacts || []).filter(item => item.status !== 'ready').map(item => <div className="paused-contact" key={item.id}><strong>{contactName(state.policy?.allowlist?.find(contact => contact.id === item.id))}</strong><p>{item.reason || item.status}</p><Button size="sm" disabled={active} onClick={() => { void run(`resolve-${item.id}`, () => api('/api/chat/resolve', { recipientId: item.id })); }}>已人工核对，解除暂停</Button></div>)}
-    <details><summary>处理记录</summary><Data value={{ contacts: (state?.contacts || []).map(item => ({ name: contactName(state?.policy?.allowlist?.find(contact => contact.id === item.id)), status: item.status, pending: Boolean(item.pending), unanswered: item.unanswered?.length || 0 })), events: state?.events || [] }} /></details>
+function FriendInteractionPanel({ state, interactions, share, api, run, busy, configured, connected = true }) {
+  const [contacts, setContacts] = useState(null), [discovery, setDiscovery] = useState(null), [switchError, setSwitchError] = useState(''), [switchStatus, setSwitchStatus] = useState('');
+  const changing = useRef(false), pending = useRef(null), existingAuthorization = useRef(false), enabled = interactions?.policy?.enabled === true;
+  const read = snapshot => ({ recipientIds: (snapshot?.policy?.allowlist || []).map(item => item.id), allowConversationOnly: existingAuthorization.current || (snapshot?.policy?.allowlist || []).some(item => ['existing-conversation', 'existing-group'].includes(item.authorizationKind)), groupMentionNamesText: (snapshot?.policy?.groupMentionNames || ['大肥鱼']).join('\n') });
+  const encode = draft => ({ recipientIds: draft.recipientIds, allowConversationOnly: draft.allowConversationOnly, groupMentionNames: draft.groupMentionNamesText.split(/[,，\n]/).map(item => item.trim()).filter(Boolean) });
+  const form = useAutoSave({ value: state, initial: read(null), read, encode, write: payload => api('/api/chat/configure', payload), canonical: (saved, payload) => saved?.policy ? encode(read(saved)) : payload, available: connected });
+  const { draft, edit } = form;
+  const shownContacts = [...new Map([...(state?.policy?.allowlist || []).map(contact => ({ ...contact, notListed: Boolean(contacts) && !contacts.some(item => item.id === contact.id) })), ...(contacts || [])].map(contact => [contact.id, contact])).values()];
+  useEffect(() => { if (pending.current !== null && enabled === pending.current) { pending.current = null; setSwitchStatus('好友互动设置已生效。'); } }, [enabled]);
+  async function toggle(value) {
+    if (changing.current) return; changing.current = true; pending.current = value; setSwitchError(''); setSwitchStatus('正在更新好友互动…');
+    try { await api('/api/interactions/configure', { enabled: value }); setSwitchStatus('已提交，等待状态同步。'); }
+    catch (error) { pending.current = null; setSwitchStatus(''); setSwitchError(error.message || '好友互动设置未生效。'); }
+    finally { changing.current = false; }
+  }
+  async function load() { const value = await api('/api/chat/contacts'); if (value.blocked || value.loginRequired || value.verificationRequired) throw new Error('请在专用浏览器完成登录或验证。'); if (!Array.isArray(value.contacts)) throw new Error('未读到可靠联系人列表，保留原许可名单。'); setContacts(value.contacts); setDiscovery(value.listDiscovery || null); }
+  return <Panel title="好友互动" badge={<Tag>{connected ? interactions?.presence?.label || (interactions?.friend?.replyRunning || state?.running ? '回复进程已启动' : enabled ? '等待就绪' : '已关闭') : '状态待核实'}</Tag>}>
+    <div className="switch-row"><span>允许好友互动</span><Switch label="允许好友互动" checked={enabled} disabled={!connected || typeof interactions?.policy?.enabled !== 'boolean' || changing.current} onChange={value => { void toggle(value); }} /></div>
+    <p className="muted">只与下方许可的好友和群聊互动，不设人数和次数上限。配置模型并选好名单后会自动准备回复；观看中可自主分享已观察的作品。群聊只在被 @ 或叫到响应昵称时回复。</p>
+    {switchStatus && <p role="status">{switchStatus}</p>}{switchError && <Note error>{switchError}</Note>}
+    {!configured && <Note>请先配置模型。名单和总开关会保留，模型就绪后自动准备互动。</Note>}
+    {interactions?.friend?.lastError && <Note error>{interactions.friend.lastError}</Note>}
+    {interactions?.friend?.message && <Note>{interactions.friend.message}</Note>}
+    {interactions?.presence?.reason && <Note>{interactions.presence.reason}</Note>}
+    <Button size="sm" variant="outline" disabled={!connected || busy.has('chatList') || form.status.kind === 'saving'} onClick={() => { void run('chatList', load); }}>读取联系人与群聊</Button>
+    <Note>读取范围是抖音网页版当前会话，不代表全部关注好友或所有群。要授权群聊，请先让群会话出现在抖音消息列表，再刷新。</Note>
+    {contacts && <p className="muted">本次读取：个人 {contacts.filter(item => item.isGroup === false).length} 个 · 群聊 {contacts.filter(item => item.isGroup === true).length} 个 · 类型待核对 {contacts.filter(item => typeof item.isGroup !== 'boolean').length} 个。{discovery?.scannedToEnd === false ? ` 当前列表尚未完整读取。${discovery.reason || ''}` : ''}</p>}
+    {contacts?.some(contact => contact.relationshipStatus === 'unavailable' || contact.isGroup === true) && <><Note>请在抖音核对所选会话的昵称、头像和类型，再勾选授权。身份不明的会话不可选；勾选授权后，选择会话才会保存名单。</Note><label><input type="checkbox" aria-label="授权已核对的现有会话" checked={draft.allowConversationOnly} onChange={event => { const value = event.target.checked; existingAuthorization.current = value; edit({ allowConversationOnly: value, ...(!value ? { recipientIds: draft.recipientIds.filter(id => shownContacts.some(contact => contact.id === id && contact.followed === true && contact.isGroup === false)) } : {}) }, value ? { blurOnly: true } : { immediate: true }); }} />我已核对所选会话，授权此名单用于互动</label></>}
+    <div className="contact-list">{[false, true, null].map(kind => { const items = shownContacts.filter(contact => contact.isGroup === kind || kind === null && typeof contact.isGroup !== 'boolean'); return items.length ? <React.Fragment key={String(kind)}><p className="muted">{kind === false ? '个人会话' : kind === true ? '群聊（仅被 @ 或叫到响应昵称时回复）' : '类型待核对（暂不可选）'}</p>{items.map(contact => <label key={contact.id}><input type="checkbox" aria-label={`许可联系人 ${contactName(contact)}`} checked={draft.recipientIds.includes(contact.id)} disabled={!connected || !draft.recipientIds.includes(contact.id) && (contact.notListed || !hasStableConversationIdentity(contact) || typeof contact.isGroup !== 'boolean' || !(contact.followed === true && contact.isGroup === false || draft.allowConversationOnly && canAuthorizeConversation(contact)))} onChange={event => edit({ recipientIds: event.target.checked ? [...draft.recipientIds, contact.id] : draft.recipientIds.filter(id => id !== contact.id) }, { immediate: true })} />{contactName(contact)}<small>{contactPermissionLabel(contact, state, draft, form.status)} · {hasStableConversationIdentity(contact) ? '稳定身份已核对' : '身份信息不足'} · {contact.notListed ? '本次列表未返回' : contact.followed === true && contact.isGroup === false ? '已关注' : contact.isGroup ? '群聊会话' : '关注关系未核实'}</small></label>)}</React.Fragment> : null; })}{!contacts && !state?.policy?.allowlist?.length && <p className="muted">尚未选择许可会话。</p>}</div>
+    <Field title="群聊响应昵称（逗号或换行分隔）"><textarea aria-label="群聊响应昵称" value={draft.groupMentionNamesText} onChange={event => edit({ groupMentionNamesText: event.target.value }, { blurOnly: true })} onBlur={() => { void form.flush(); }} rows={2} /></Field>
+    <AutoSaveStatus status={form.status} />
+    <Note>今日回复模型请求 {state?.daily?.requests || 0} 次 · 今日分享 {share?.daily?.attempts || 0} 次。未确认发送会暂停，不自动重发。</Note>
+    {(state?.contacts || []).filter(item => item.status !== 'ready').map(item => <div className="paused-contact" key={item.id}><strong>{contactName(state?.policy?.allowlist?.find(contact => contact.id === item.id))}</strong><p>{item.reason || item.status}</p><Button size="sm" disabled={!connected || form.status.kind === 'saving' || busy.has('chatList') || busy.has(`resolve-${item.id}`)} onClick={() => { void run(`resolve-${item.id}`, () => api('/api/chat/resolve', { recipientId: item.id })); }}>{busy.has(`resolve-${item.id}`) ? '正在核对…' : '已人工核对，解除暂停'}</Button></div>)}
+    <ShareReceipts state={share} api={api} run={run} busy={busy} connected={connected} />
+    <details><summary>回复处理记录</summary><Data value={{ contacts: (state?.contacts || []).map(item => ({ name: contactName(state?.policy?.allowlist?.find(contact => contact.id === item.id)), status: item.status, pending: Boolean(item.pending), unanswered: item.unanswered?.length || 0 })), events: state?.events || [] }} /></details>
   </Panel>;
 }
 
@@ -180,23 +242,23 @@ export function App() {
   const [video, setVideo] = useState(null), [audio, setAudio] = useState(null), [chat, setChat] = useState(null), [browser, setBrowser] = useState(null);
   const [watch, setWatch] = useState(null), [watchSynced, setWatchSynced] = useState(false), [persona, setPersona] = useState(null);
   const [taskLimits, setTaskLimits] = useState(null), [share, setShare] = useState(null);
-  const [spark, setSpark] = useState(null), [sparkSynced, setSparkSynced] = useState(false);
   const [mode, setMode] = useState(null), [comments, setComments] = useState(null), [connectionError, setConnectionError] = useState('');
   const [tasks, setTasks] = useState([]), [selectedTask, setSelectedTask] = useState(null), [events, setEvents] = useState([]), [running, setRunning] = useState(false), [instruction, setInstruction] = useState('');
   const [schedule,setSchedule]=useState(null),[interactions,setInteractions]=useState(null),[updatesOpen,setUpdatesOpen]=useState(false);
   const [view, setView] = useState('settings'), [settingsCategory, setSettingsCategory] = useState('基础设置'), [rightOpen, setRightOpen] = useState(false), [error, setError] = useState(''), [busy, setBusy] = useState(new Set()), [suggestedUrl, setSuggestedUrl] = useState('');
+  const [operationErrors, setOperationErrors] = useState({}), [pollError, setPollError] = useState('');
   const lock = useRef(new Set()), revision = useRef(0), bootRef = useRef(null), currentTask = useRef(null), pollRef = useRef(null), submitLock = useRef(false), restoredSelection = useRef(false);
   const configured = settings.configured && boot?.config?.configured === true;
   const allowed = boot?.videoTime?.enabled !== true || video?.allowed === true;
   const watchActive = watchIsActive(watch), watchReady = boot?.watch?.available !== true || watchSynced;
-  const sparkReady = boot?.spark?.available !== true || sparkSynced;
   const manualBusy = running || busy.has('task') || busy.has('forward') || share?.busy === true;
-  const operationActive = manualBusy || watchActive || comments?.busy || busy.has('watchStart') || busy.has('chatStart') || chat?.running || chat?.starting || chat?.busy || chat?.worker?.alive || busy.has('sparkStart') || spark?.running || spark?.starting || spark?.busy || spark?.worker?.alive;
+  const operationActive = manualBusy || watchActive || comments?.busy || busy.has('watchStart') || busy.has('chatStart') || chat?.starting || chat?.busy;
   const run = useCallback(async (name, action) => {
     if (lock.current.has(name)) return;
-    lock.current.add(name); setBusy(new Set(lock.current)); setError('');
+    lock.current.add(name); setBusy(new Set(lock.current));
+    setOperationErrors(old => { const next = { ...old }; delete next[name]; return next; });
     try { const result = await action(); await pollRef.current?.(); return result; }
-    catch (failure) { setError(failure?.message || '操作未完成，请检查本机服务。'); }
+    catch (failure) { const detail = requestFailure(failure, operationLabel(name)); setOperationErrors(old => ({ ...old, [name]: { message: detail.message, requestError: detail.requestError === true, unconfirmed: detail.unconfirmed === true } })); }
     finally { lock.current.delete(name); setBusy(new Set(lock.current)); }
   }, []);
   useEffect(() => {
@@ -206,7 +268,7 @@ export function App() {
       try {
         if (!bootRef.current || ticks++ % 5 === 0) {
           const value = await client.bootstrap(); if (!alive) return;
-          if (value.sessionChanged) { revision.current = 0; currentTask.current = null; setEvents([]); setWatchSynced(false); setSparkSynced(false); }
+          if (value.sessionChanged) { revision.current = 0; currentTask.current = null; setEvents([]); setWatchSynced(false); }
           bootRef.current = value; setBoot(value);
           if (bridge?.getSettings) { const value = await bridge.getSettings(); if (!alive) return; setSettings(publicSettings(value)); }
         }
@@ -219,9 +281,10 @@ export function App() {
         }
         setEvents(old => mergeEvents(old, value.events, currentTask.current)); revision.current = value.revision || revision.current;
         if (value.browser) setBrowser(value.browser);
-        const reads = [['/api/watch/schedule',setSchedule],['/api/interactions/state',setInteractions],bootRef.current.videoTime?.enabled ? ['/api/video/status', setVideo] : null, ['/api/task/limits', setTaskLimits], bootRef.current.mode?.available ? ['/api/mode/state', setMode] : null, bootRef.current.comments?.available ? ['/api/comments/state', setComments] : null, ['/api/chat/state', setChat], bootRef.current.media?.available ? ['/api/media/state', setAudio] : null, bootRef.current.watch?.available ? ['/api/watch/state', setWatch] : null, bootRef.current.share?.available ? ['/api/share/state', setShare] : null, bootRef.current.spark?.available ? ['/api/spark/state', setSpark] : null, bootRef.current.persona?.available ? ['/api/persona', setPersona] : null].filter(Boolean);
-        await Promise.allSettled(reads.map(async ([route, setter]) => { try { const state = await client.request(route); if (route === '/api/spark/state' && state?.protocol !== 'spark-v1') throw new Error('自动问候状态格式尚未核实。'); if (alive) { setter(state); if (route === '/api/watch/state') setWatchSynced(true); if (route === '/api/spark/state') setSparkSynced(true); } } catch (failure) { if (alive && route === '/api/watch/state') setWatchSynced(false); if (alive && route === '/api/spark/state') setSparkSynced(false); if (alive && route === '/api/mode/state') setMode(null); if (alive && route === '/api/comments/state') setComments(null); throw failure; } }));
-      } catch (failure) { if (alive) { setConnected(false); setWatchSynced(false); setSparkSynced(false); setMode(null); setComments(null); bootRef.current = null; setConnectionError(failure.message || '正在重新连接本机服务。'); } }
+        const reads = [['/api/watch/schedule',setSchedule],['/api/interactions/state',setInteractions],bootRef.current.videoTime?.enabled ? ['/api/video/status', setVideo] : null, ['/api/task/limits', setTaskLimits], bootRef.current.mode?.available ? ['/api/mode/state', setMode] : null, bootRef.current.comments?.available ? ['/api/comments/state', setComments] : null, ['/api/chat/state', setChat], bootRef.current.media?.available ? ['/api/media/state', setAudio] : null, bootRef.current.watch?.available ? ['/api/watch/state', setWatch] : null, bootRef.current.share?.available ? ['/api/share/state', setShare] : null, bootRef.current.persona?.available ? ['/api/persona', setPersona] : null].filter(Boolean);
+        const results = await Promise.allSettled(reads.map(async ([route, setter]) => { try { const state = await client.request(route); if (alive) { setter(state); if (route === '/api/watch/state') setWatchSynced(true); } } catch (failure) { if (alive && route === '/api/watch/state') setWatchSynced(false); if (alive && ['/api/interactions/state', '/api/chat/state', '/api/watch/state', '/api/share/state', '/api/watch/schedule', '/api/mode/state', '/api/comments/state'].includes(route)) setter(null); throw failure; } }));
+        if (alive) setPollError(results.filter(item => item.status === 'rejected').map(item => item.reason.message).join(' '));
+      } catch (failure) { if (alive) { setConnected(false); setWatchSynced(false); setMode(null); setComments(null); setPollError(''); bootRef.current = null; setConnectionError(failure.message || '正在重新连接本机服务。'); } }
       finally { polling = false; }
     }
     pollRef.current = poll; void poll(); const timer = setInterval(() => { void poll(); }, 1500);
@@ -237,16 +300,16 @@ export function App() {
       catch (failure) { submitLock.current = false; throw failure; }
     });
   }
-  async function saved(value) { setSettings(publicSettings(value)); setSettingsOpen(false); bootRef.current = null; await pollRef.current?.(); }
+  async function saved(value) { setSettings(publicSettings(value)); bootRef.current = null; await pollRef.current?.(); }
   function pick(url) { if (!/^https:\/\/(?:www\.)?douyin\.com\/video\/\d+\/?$/.test(url || '')) { setError('当前作品链接尚未核实，请使用公开作品地址。'); return; } setSuggestedUrl(url); setRightOpen(true); }
   const task = tasks.find(item => item.id === selectedTask), selectedEvents = events.filter(item => !task || item.taskId === task.id);
   const answer = task?.message || selectedEvents.filter(item => item.type === 'model.answer').at(-1)?.message;
-  const stopWatch = () => { void run('watchStop', () => api('/api/watch/stop', {})); };
-  const watchControls = boot?.watch?.available && <WatchControls state={watch} video={video} configured={configured} connected={connected && watchReady} otherBusy={manualBusy} busy={busy} run={run} api={api} onView={() => setView('watch')} />;
+  const stopWatch = () => { void run('watchSchedule', () => api('/api/watch/schedule', { enabled: false })); };
+
   const settingsPage = <div className="settings-page"><h1>大肥鱼抖音助手</h1><div role="tablist" aria-label="刷抖音设置分类" className="settings-tabs">{Object.keys(SETTINGS_SECTIONS).map(name => <Button key={name} role="tab" aria-selected={settingsCategory === name} size="sm" variant={settingsCategory === name ? 'primary' : 'outline'} onClick={() => setSettingsCategory(name)}>{name}</Button>)}</div>
     {settingsCategory === '基础设置' && <><Panel title="模型设置"><p className="muted">独立软件使用自己的 API Key，设置控件与插件采用同一套 DSH 组件。</p><p>当前模型：{settings.model || '尚未配置'} · {configured ? '已配置 Key' : '尚未配置 Key'}</p><Button size="sm" onClick={() => setSettingsOpen(true)}>配置模型与 API Key</Button></Panel><PersonaPanel snapshot={persona} onSnapshot={setPersona} api={api} run={run} bridge={bridge} busy={busy} watchState={watch} watchReady={watchReady} /><details><summary>检索共享记忆</summary><MemoryView settings={settings} api={api} run={run} busy={busy} bridge={bridge} /></details></>}
-    {settingsCategory === '视频观看' && <><SchedulePanel state={schedule} api={api} run={run} busy={busy} connected={connected} /><TopicPanel state={watch?.options} active={watchActive} api={api} run={run} busy={busy} connected={connected && watchReady} /><VideoPanel state={video} api={api} run={run} busy={busy}>{watchControls}{boot?.mode?.available && <SilentPanel state={mode} connected={connected} api={api} run={run} busy={busy} />}</VideoPanel><TaskBudgetPanel state={taskLimits} api={api} run={run} busy={busy} operationActive={operationActive} /></>}
-    {settingsCategory === '好友互动' && <><InteractionStatus state={interactions}/><ChatPanel state={chat} api={api} run={run} busy={busy} configured={configured} />{boot?.spark?.available && <SparkPanel state={spark} api={api} run={run} busy={busy} configured={configured} connected={connected && sparkReady} />}{boot?.share?.available ? <AutoSharePanel state={share} api={api} run={run} busy={busy} connected={connected} /> : boot?.forward?.available && <ForwardPanel api={api} run={run} busy={busy} allowed={allowed && configured && connected && watchReady} running={manualBusy || watchActive} suggestedUrl={suggestedUrl} />}</>}
+    {settingsCategory === '视频观看' && <><TopicPanel state={watch?.options} active={watchActive} api={api} run={run} busy={busy} connected={connected && watchReady} /><VideoPanel state={video} schedule={schedule} watch={watch} api={api} run={run} busy={busy} connected={connected} configured={configured}>{boot?.mode?.available && <SilentPanel state={mode} connected={connected} api={api} run={run} busy={busy} />}</VideoPanel><TaskBudgetPanel state={taskLimits} api={api} run={run} busy={busy} operationActive={operationActive} /></>}
+    {settingsCategory === '好友互动' && <FriendInteractionPanel state={chat} interactions={interactions} share={share} api={api} run={run} busy={busy} configured={configured} connected={connected} />}
     {settingsCategory === '公开评论' && <CommentsPanel state={comments} connected={connected} api={api} run={run} busy={busy} />}
     {settingsCategory === '音频与密钥' && <AudioPanel state={audio} api={api} run={run} busy={busy} bridge={bridge} operationActive={operationActive} />}
     {settingsCategory === '观看日报' && <ReportsView connected={connected} api={api} run={run} busy={busy} />}
@@ -258,18 +321,19 @@ export function App() {
       <div className="sidebar-label">本次运行的任务</div><div className="task-list">{tasks.map(item => <button className={item.id === selectedTask && view === 'chat' ? 'task-item selected' : 'task-item'} key={item.id} onClick={() => { setSelectedTask(item.id); setView('chat'); }}><span>{item.instruction || '视频任务'}</span><small>{statusLabel(item.status)}</small></button>)}{!tasks.length && <p className="sidebar-empty">任务记录会出现在这里。</p>}</div>
       <div className="sidebar-bottom"><small className="software-version">独立 API 版 · {__APP_VERSION__}</small><Button size="sm" disabled={busy.has('refresh')} onClick={() => { void run('refresh', async () => { bootRef.current = null; await pollRef.current?.(); }); }}>刷新连接</Button><button className="nav-link" onClick={() => setUpdatesOpen(true)}>检查更新</button><div className="connection"><StateDot state={connected ? running ? 'ongoing' : 'done' : 'warning'} /><span>{connected ? running ? '正在执行任务' : '本机服务已连接' : '正在连接本机服务'}</span></div></div>
     </aside>
-    <main className={`${frame.centerCol} main-column`}><header className="topbar"><div><strong>{view === 'settings' ? '刷抖音设置' : view === 'health' ? '自检与用量' : view === 'reports' ? '观看日报' : view === 'memory' ? '共享记忆与人格' : view === 'watch' ? '自主观看' : task?.instruction || '对话与视频'}</strong><small>{settings.model || boot?.config?.model}</small></div><div className="actions">{settings.configured && !settingsOpen && <Button size="sm" variant="outline" disabled={!connected || busy.has('browserOpen')} onClick={openDouyin}>{busy.has('browserOpen') ? '正在打开抖音…' : '打开抖音'}</Button>}{view !== 'settings' && <Button size="sm" onClick={() => setRightOpen(old => !old)}>{rightOpen ? '收起快捷控制' : '展开快捷控制'}</Button>}</div></header>
-      {(error || connectionError) && <div className="global-error" role="alert"><span>{error || connectionError}</span><button aria-label="关闭提示" onClick={() => { setError(''); setConnectionError(''); }}>×</button></div>}
+    <main className={`${frame.centerCol} main-column`}><header className="topbar"><div><strong>{view === 'settings' ? '刷抖音设置' : view === 'health' ? '自检与用量' : view === 'reports' ? '观看日报' : view === 'memory' ? '共享记忆与人格' : view === 'watch' ? '自主观看' : task?.instruction || '对话与视频'}</strong><small>{settings.model || boot?.config?.model}</small></div><div className="actions"><FriendPresence presence={interactions?.presence} connected={connected} onOpen={() => { setSettingsCategory('好友互动'); setView('settings'); }} />{settings.configured && !settingsOpen && <Button size="sm" variant="outline" disabled={!connected || busy.has('browserOpen')} onClick={openDouyin}>{busy.has('browserOpen') ? '正在打开抖音…' : '打开抖音'}</Button>}{view !== 'settings' && <Button size="sm" onClick={() => setRightOpen(old => !old)}>{rightOpen ? '收起快捷控制' : '展开快捷控制'}</Button>}</div></header>
+      {(error || connectionError || pollError) && <div className="global-error" role="alert"><span>{[error, connectionError, pollError].filter(Boolean).join(' ')}</span><button aria-label="关闭提示" onClick={() => { setError(''); setConnectionError(''); setPollError(''); }}>×</button></div>}
+      {Object.entries(operationErrors).map(([name, failure]) => <div className="global-error" role="alert" key={name}><span>{failure.requestError ? '上次操作：' : ''}{failure.message}{failure.requestError && connected ? failure.unconfirmed ? ' 本机服务当前已连接；请核对上述操作是否生效。' : ' 本机服务当前已连接。' : ''}</span><button aria-label={`清除${operationLabel(name)}提示`} onClick={() => setOperationErrors(old => { const next = { ...old }; delete next[name]; return next; })}>×</button></div>)}
       {boot?.watch?.available && !watchReady && <div className="watch-running-strip" role="status">自主观看状态尚未核实，请等待本机服务回读后再开始操作。</div>}
-      {watchActive && <div className="watch-running-strip" role="status"><span>{statusLabel(watch?.status)} · {video?.remainingSeconds === null ? '本轮不限单轮时长' : `自主观看剩余 ${Math.max(0, Math.floor(video?.remainingSeconds ?? watch?.remainingSeconds ?? 0))} 秒`}</span><Button size="sm" disabled={busy.has('watchStop')} onClick={stopWatch}>停止当前自主观看</Button></div>}
+      {watchActive && <div className="watch-running-strip" role="status">自主观看进行中 · 今日已观看 {Math.floor(video?.daily?.usedSeconds || 0)} 秒 · 模型请求 {video?.daily?.requests || 0} 次</div>}
       {view === 'settings' ? settingsPage : view === 'health' ? <HealthDashboard api={api} run={run} busy={busy} connected={connected} /> : view === 'reports' ? <ReportsView connected={connected} api={api} run={run} busy={busy} /> : view === 'memory' ? <MemoryView api={api} run={run} settings={settings} bridge={bridge} busy={busy} persona={persona} onPersona={setPersona} personaAvailable={boot?.persona?.available} watchState={watch} watchReady={watchReady} /> : view === 'watch' ? <WatchView state={watch} video={video} browser={browser} snapshot={persona} onSettings={() => setRightOpen(true)} /> : <>
         <div className="conversation" aria-live="polite">{!task ? <div className="welcome"><div className="welcome-symbol">◉</div><h1>今天想看些什么？</h1><p>搜索作品、观察视频，把值得记住的内容留下来。</p><div className="suggestions">{EXAMPLES.slice(0, 4).map(([label, value]) => <Button variant="outline" key={label} onClick={() => setInstruction(value)}>{label} ↗</Button>)}</div></div> : <><div className="user-message">{task.instruction}</div><div className="assistant-message"><div className="assistant-avatar">鱼</div><div className="assistant-content">{answer ? <MarkdownText text={answer} labels={MARKDOWN_LABELS} streaming={false} /> : <p className="muted">{running && task.id === currentTask.current ? '正在查看与操作专用浏览器…' : '还没有模型答复。'}</p>}{task.partialMessage && <MarkdownText text={task.partialMessage} labels={MARKDOWN_LABELS} />}{task.status && <small className="task-status">{statusLabel(task.status)}</small>}<details className="activity" open={running && task.id === currentTask.current}><summary>运行过程 · {selectedEvents.length} 条</summary>{selectedEvents.map(item => <EventItem key={item.revision} event={item} />)}</details></div></div></>}</div>
-        <div className="composer-area"><div className="quick-actions">{EXAMPLES.map(([label, value]) => <button key={label} type="button" onClick={() => setInstruction(value)}>{label}</button>)}</div><form className="composer" onSubmit={submit}><textarea aria-label="视频任务" placeholder={configured ? '告诉大肥鱼这次想看什么…' : '先在设置中连接 API Key'} maxLength={4000} value={instruction} onChange={event => setInstruction(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form.requestSubmit(); } }} /><div className="composer-footer"><span>{boot?.limits ? `最多 ${taskLimits?.policy?.maxSteps ?? boot.limits.maxSteps ?? 20} 步 · ${taskLimits?.policy?.maxToolCalls ?? boot.limits.maxToolCalls} 次工具 · ${taskLimits?.policy?.timeoutSeconds ?? boot.limits.taskTimeoutSeconds} 秒` : 'Enter 发送 · Shift + Enter 换行'}</span>{running ? <Button variant="outline" disabled={busy.has('stop')} onClick={() => { void run('stop', () => api('/api/stop', {})); }}>■ 停止任务</Button> : <Button variant="primary" type="submit" disabled={watchActive || share?.busy || !watchReady || busy.has('watchStart') || !configured || !connected || !allowed || !instruction.trim() || busy.has('task') || busy.has('forward')}>开始任务 ↑</Button>}</div></form>{watchActive && <p className="composer-hint">自主观看正在运行。停止后可手动下达视频任务。</p>}{!watchActive && <p className="composer-hint">手动任务的次数、步骤和超时独立于视频时段与自主观看预算，任一预算先到会停止。持续看可用自主观看，不会自动续时。</p>}{!allowed && <p className="composer-hint">{video?.reason || '请先在右侧开始新一轮视频。'}</p>}</div>
+        <div className="composer-area"><div className="quick-actions">{EXAMPLES.map(([label, value]) => <button key={label} type="button" onClick={() => setInstruction(value)}>{label}</button>)}</div><form className="composer" onSubmit={submit}><textarea aria-label="视频任务" placeholder={configured ? '告诉大肥鱼这次想看什么…' : '先在设置中连接 API Key'} maxLength={4000} value={instruction} onChange={event => setInstruction(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form.requestSubmit(); } }} /><div className="composer-footer"><span>{boot?.limits ? `最多 ${taskLimits?.policy?.maxSteps ?? boot.limits.maxSteps ?? 20} 步 · ${taskLimits?.policy?.maxToolCalls ?? boot.limits.maxToolCalls} 次工具 · ${taskLimits?.policy?.timeoutSeconds ?? boot.limits.taskTimeoutSeconds} 秒` : 'Enter 发送 · Shift + Enter 换行'}</span>{running ? <Button variant="outline" disabled={busy.has('stop')} onClick={() => { void run('stop', () => api('/api/stop', {})); }}>■ 停止任务</Button> : <Button variant="primary" type="submit" disabled={watchActive || share?.busy || !watchReady || busy.has('watchStart') || !configured || !connected || !allowed || !instruction.trim() || busy.has('task') || busy.has('forward')}>开始任务 ↑</Button>}</div></form>{watchActive && <p className="composer-hint">自主观看正在运行。停止后可手动下达视频任务。</p>}{!watchActive && <p className="composer-hint">手动任务的次数、步骤和超时独立于视频时段与自主观看预算，任一预算先到会停止。自动观看按每日预算和允许时段运行。</p>}{!allowed && <p className="composer-hint">{video?.reason || '请在设置中开启自动观看并确认允许时段。'}</p>}</div>
       </>}
     </main>
-    {rightOpen && view !== 'settings' && <aside className="business-sidebar" aria-label="业务设置"><div className="business-heading"><strong>业务设置</strong><small>由你明确控制</small></div>{boot?.videoTime?.enabled ? <VideoPanel state={video} api={api} run={run} busy={busy}>{watchControls}<TopicPanel state={watch?.options} active={watchActive} api={api} run={run} busy={busy} connected={connected && watchReady} />{boot?.mode?.available && <SilentPanel state={mode} connected={connected} api={api} run={run} busy={busy} />}</VideoPanel> : watchControls}<TaskBudgetPanel state={taskLimits} api={api} run={run} busy={busy} operationActive={operationActive} /><BrowserPanel browser={browser} onPick={pick} manualForward={boot?.share?.available !== true} />{boot?.media?.available && <AudioPanel state={audio} api={api} run={run} busy={busy} bridge={bridge} operationActive={operationActive} />}{boot?.comments?.available && <CommentsPanel state={comments} connected={connected} api={api} run={run} busy={busy} />}<ChatPanel state={chat} api={api} run={run} busy={busy} configured={configured} />{boot?.spark?.available && <SparkPanel state={spark} api={api} run={run} busy={busy} configured={configured} connected={connected && sparkReady} />}{boot?.share?.available ? <AutoSharePanel state={share} api={api} run={run} busy={busy} connected={connected} /> : boot?.forward?.available && <ForwardPanel api={api} run={run} busy={busy} allowed={allowed && configured && connected && watchReady} running={manualBusy || watchActive || busy.has('watchStart')} suggestedUrl={suggestedUrl} />}</aside>}
+    {rightOpen && view !== 'settings' && <aside className="business-sidebar" aria-label="业务设置"><div className="business-heading"><strong>业务设置</strong><small>由你明确控制</small></div>{boot?.videoTime?.enabled ? <VideoPanel state={video} schedule={schedule} watch={watch} api={api} run={run} busy={busy} connected={connected} configured={configured}><TopicPanel state={watch?.options} active={watchActive} api={api} run={run} busy={busy} connected={connected && watchReady} />{boot?.mode?.available && <SilentPanel state={mode} connected={connected} api={api} run={run} busy={busy} />}</VideoPanel> : null}<TaskBudgetPanel state={taskLimits} api={api} run={run} busy={busy} operationActive={operationActive} /><BrowserPanel browser={browser} onPick={pick} manualForward={boot?.share?.available !== true} />{boot?.media?.available && <AudioPanel state={audio} api={api} run={run} busy={busy} bridge={bridge} operationActive={operationActive} />}{boot?.comments?.available && <CommentsPanel state={comments} connected={connected} api={api} run={run} busy={busy} />}<FriendInteractionPanel state={chat} interactions={interactions} share={share} api={api} run={run} busy={busy} configured={configured} connected={connected} /></aside>}
     {updatesOpen && <UpdateDialog bridge={bridge} operationActive={operationActive} onClose={()=>setUpdatesOpen(false)}/>}
-    {(!settings.configured || settingsOpen) && <ApiSettings settings={settings} bridge={bridge} onSaved={saved} onClose={() => setSettingsOpen(false)} run={run} busy={busy.has('settings') || busy.has('clearKey')} operationActive={operationActive || !watchReady || !sparkReady} watchActive={watchActive} onStopWatch={stopWatch} onOpenDouyin={openDouyin} openingDouyin={busy.has('browserOpen')} connected={connected} operationError={error || connectionError} />}
+    {(!settings.configured || settingsOpen) && <ApiSettings settings={settings} bridge={bridge} onSaved={saved} onClose={() => setSettingsOpen(false)} run={run} busy={busy.has('settings') || busy.has('clearKey')} operationActive={operationActive || !watchReady} watchActive={watchActive} onStopWatch={stopWatch} onOpenDouyin={openDouyin} openingDouyin={busy.has('browserOpen')} connected={connected} operationError={[error, connectionError, ...Object.values(operationErrors).map(item => item.message)].filter(Boolean).join(' ')} />}
   </div>;
 }
 

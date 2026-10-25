@@ -28,10 +28,10 @@ async function fixture(t) {
   return { root, server, config, controller, watchService, personaMemory, videoLimits, base, bootstrap, request, entered, decisionProvider, pauses, actions, closes: () => closes };
 }
 
-test('自主观看和人格HTTP校验token；有限轮次、互斥及手编版本由真实服务执行', async t => {
+test('自主观看和人格HTTP校验token；允许开关、共享互斥与手编版本由真实服务执行', async t => {
   const f = await fixture(t); assert.equal(f.bootstrap.watch.available, true); assert.equal(f.bootstrap.persona.available, true);
   assert.equal((await fetch(`${f.base}/api/persona`)).status, 403); assert.equal((await fetch(`${f.base}/api/watch/state`)).status, 403);
-  assert.equal((await f.request('/api/watch/start', {})).status, 409); assert.equal((await f.request('/api/watch/start', { unsafe: true })).status, 400);
+  assert.equal((await f.request('/api/watch/start', {startSession:false})).status, 409); assert.equal((await f.request('/api/watch/start', { unsafe: true })).status, 400);
   assert.equal((await f.request('/api/video/start', {})).status, 200);
   const started = await f.request('/api/watch/start', { startSession: false, maxRequests: 2 }); assert.equal(started.status, 200); await f.entered.promise;
   const persona = await f.request('/api/persona'); assert.equal(persona.status, 200);

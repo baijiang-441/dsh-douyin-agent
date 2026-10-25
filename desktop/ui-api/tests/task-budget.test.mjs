@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import { chromium } from '../../../playwright-runtime.mjs';
 import { DEFAULT_TASK_POLICY, TASK_LIMIT_BOUNDS } from '../../../task-limits.mjs';
 
-test('手动任务预算组件保留未保存输入、运行时禁改，只显式保存三个有限上限', { timeout: 30_000 }, async t => {
+test('手动任务预算自动保存合法数字，保留未完成输入并在运行时禁改', { timeout: 30_000 }, async t => {
   const root = fileURLToPath(new URL('../', import.meta.url)), desktop = createRequire(new URL('../../package.json', import.meta.url)), local = createRequire(new URL('../package.json', import.meta.url));
   const { build } = desktop('esbuild');
   const output = path.join(root, '.test-temp', 'task-budget'); await fs.mkdir(output, { recursive: true });
@@ -46,16 +46,16 @@ createRoot(document.getElementById('root')).render(<Harness/>);` }, outfile: pat
   t.after(async () => { await browser.close(); assert.equal(path.dirname(path.resolve(profile)), path.resolve(tmpdir())); await fs.rm(profile, { recursive: true, force: true }); });
   const page = browser.pages()[0]; page.on('pageerror', error => errors.push(error.message)); await page.goto(`http://127.0.0.1:${server.address().port}`);
   const steps = page.getByRole('spinbutton', { name: '手动任务步数上限', exact: true }), calls = page.getByRole('spinbutton', { name: '手动任务工具调用上限', exact: true }), seconds = page.getByRole('spinbutton', { name: '手动任务超时秒数', exact: true });
-  const save = page.getByRole('button', { name: '保存手动任务预算', exact: true });
+  assert.equal(await page.getByRole('button', { name: '保存手动任务预算', exact: true }).count(), 0);
   await page.waitForFunction(() => document.querySelector('[aria-label="手动任务步数上限"]')?.disabled === false);
   assert.equal(await steps.inputValue(), '20'); assert.equal(await calls.inputValue(), '20'); assert.equal(await seconds.inputValue(), '180'); assert.equal(posts.length, 0);
-  await steps.fill('40'); await calls.fill('45'); await seconds.fill('600'); await page.waitForTimeout(250);
-  assert.equal(await steps.inputValue(), '40'); assert.equal(await seconds.inputValue(), '600');
+  await steps.fill('40'); await calls.fill('45'); await seconds.fill('9'); await page.waitForTimeout(700);
+  assert.equal(await steps.inputValue(), '40'); assert.equal(await seconds.inputValue(), '9'); assert.equal(posts.length, 0);
   operationActive = true; await page.waitForFunction(() => document.querySelector('[aria-label="手动任务步数上限"]').disabled === true);
-  assert.equal(await save.isDisabled(), true); assert.equal(posts.length, 0); assert.equal(await calls.inputValue(), '45');
+  assert.equal(await seconds.isDisabled(), true); assert.equal(posts.length, 0); assert.equal(await calls.inputValue(), '45');
   operationActive = false; await page.waitForFunction(() => document.querySelector('[aria-label="手动任务步数上限"]').disabled === false);
-  await seconds.fill('9'); await save.click(); assert.equal(await seconds.evaluate(input => input.validity.rangeUnderflow), true); assert.equal(posts.length, 0);
-  await seconds.fill('600'); await save.click(); await page.getByText('手动任务预算已保存，将用于之后启动的任务。', { exact: true }).waitFor();
+  assert.equal(await seconds.evaluate(input => input.validity.rangeUnderflow), true); assert.equal(posts.length, 0);
+  await seconds.fill('600'); await page.getByText('已生效。', { exact: true }).waitFor();
   assert.deepEqual(posts, [{ route: '/api/task/limits', body: { maxSteps: 40, maxToolCalls: 45, timeoutSeconds: 600 } }]);
   await page.getByText('这三个上限只控制手动模型任务。保存不会改变视频允许时段或本轮截止，也不会重置自主观看预算。', { exact: true }).waitFor();
   policy = { maxSteps: 25, maxToolCalls: 30, timeoutSeconds: 240 };

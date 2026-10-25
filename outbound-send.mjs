@@ -8,6 +8,7 @@ const kinds = new Set(['spark', 'reply', 'video']);
 const identifier = value => typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= 500 && !/[\x00-\x1f]/.test(value);
 const shanghaiDay = value => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(value));
 const failure = (message, code = 'OUTBOUND_INVALID') => Object.assign(new Error(message), { code, status: 409, beforeDelivery: true });
+const lockInitializationGraceMs = 500;
 
 // 三种发送共用同一把本机锁；账本只保存可核对的发出凭据，不保存正文。
 export class OutboundCoordinator {
@@ -36,15 +37,31 @@ export class OutboundCoordinator {
   }
   async acquire(signal) {
     fs.mkdirSync(this.stateDir, { recursive: true });
-    const started = Date.now(), owner = { pid: process.pid, token: randomUUID(), source: this.source };
+    const started = Date.now(), owner = { pid: process.pid, token: randomUUID(), source: this.source }; let retriedDisappearance = false, emptyObservedAt = null;
     while (true) {
       signal?.throwIfAborted();
       let descriptor;
       try { descriptor = fs.openSync(this.guardFile, 'wx', 0o600); }
       catch (error) {
         if (error.code !== 'EEXIST') throw error;
-        let current;
-        try { const stat = fs.lstatSync(this.guardFile); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2048) throw Error(); current = JSON.parse(fs.readFileSync(this.guardFile, 'utf8')); }
+        let stat, contents, current;
+        try { stat = fs.lstatSync(this.guardFile); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2048) throw Error(); if (stat.size > 0) contents = fs.readFileSync(this.guardFile, 'utf8'); }
+        catch (inspectError) {
+          if (inspectError.code === 'ENOENT') {
+            if (retriedDisappearance && Date.now() - started >= this.waitMs) throw failure('另一项聊天或分享仍在发送，已保留待发内容，请稍后重试。', 'OUTBOUND_BUSY');
+            retriedDisappearance = true; continue;
+          }
+          throw failure('共同发送锁不完整，需要核对；未自动移除。', 'OUTBOUND_RECOVERY_REQUIRED');
+        }
+        if (stat.size === 0) {
+          const observedAt = Date.now(); emptyObservedAt ??= observedAt;
+          const age = observedAt - Math.floor(stat.mtimeMs), waiting = observedAt - emptyObservedAt;
+          if (!Number.isFinite(age) || age < 0 || age >= lockInitializationGraceMs || waiting >= lockInitializationGraceMs) throw failure('共同发送空锁未在启动宽限内写完，需要核对；未自动移除。', 'OUTBOUND_RECOVERY_REQUIRED');
+          if (Date.now() - started >= this.waitMs) throw failure('另一项聊天或分享仍在发送，已保留待发内容，请稍后重试。', 'OUTBOUND_BUSY');
+          await delay(Math.min(40, Math.max(1, lockInitializationGraceMs - age), Math.max(1, lockInitializationGraceMs - waiting), Math.max(1, this.waitMs - (Date.now() - started))), undefined, { signal });
+          continue;
+        }
+        try { current = JSON.parse(contents); }
         catch { throw failure('共同发送锁不完整，需要核对；未自动移除。', 'OUTBOUND_RECOVERY_REQUIRED'); }
         if (!Number.isSafeInteger(current?.pid) || current.pid < 1 || !identifier(current.token)) throw failure('共同发送锁身份不明，需要核对；未自动移除。', 'OUTBOUND_RECOVERY_REQUIRED');
         try { process.kill(current.pid, 0); } catch (probe) { if (probe.code !== 'EPERM') throw failure('上次共同发送锁仍在，需要先核对发送结果；未抢锁。', 'OUTBOUND_RECOVERY_REQUIRED'); }

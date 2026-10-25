@@ -138,7 +138,7 @@ test('设置页模型选择通过真实 SDK 元数据验证，运行中的私信
   assert.equal(f.metadata.length, 0);
   const saved = await f.request('/model/configure', { provider: 'synthetic-native', model: 'visual-model' });
   assert.equal(saved.status, 200); assert.equal(saved.body.configured, true); assert.equal(f.metadata.length, 1);
-  for (const [service, field] of [['spark', 'starting'], ['spark', 'busy'], ['chat', 'running'], ['chat', 'busy']]) {
+  for (const [service, field] of [['spark', 'starting'], ['spark', 'busy'], ['chat', 'starting'], ['chat', 'busy']]) {
     f.flags[service][field] = true;
     assert.equal((await f.request('/model/configure', { provider: 'synthetic-native', model: 'other-model' })).status, 409);
     delete f.flags[service][field];
@@ -155,7 +155,7 @@ test('真实 SDK 元数据查询尚未结束时若启动服务，原生设置拒
   const saving = f.request('/model/configure', { provider: 'synthetic-native', model: 'new-model' });
   try {
     await Promise.race([entered.promise, saving.then(result => { throw new Error(`模型元数据查询前请求已结束：HTTP ${result.status}`); })]);
-    f.flags.chat.running = true;
+    f.flags.chat.busy = true;
   } finally { finish.resolve(); }
   const result = await saving; assert.equal(result.status, 409); assert.equal(f.modelSettings.state().model, 'old-model');
 });
@@ -163,7 +163,7 @@ test('真实 SDK 元数据查询尚未结束时若启动服务，原生设置拒
 test('时间、静默、独立视频轮次和一键打开均由原生设置直接操作，不通过对话', async t => {
   const f = await fixture(t); await f.bootstrap();
   assert.equal((await f.request('/video/configure', { windows: ['11:00-14:00'], sessionMinutes: 12 })).status, 200);
-  assert.equal(f.limits.state().policy.sessionMinutes, 12);
+  assert.equal(f.limits.state().policy.dailyMinutes, 12);
   assert.equal((await f.request('/mode/configure', { silent: true })).status, 200); assert.equal(f.mode.state().silent, true);
   assert.equal((await f.request('/video/start', {})).status, 200); assert.equal(f.limits.state().session.startedBy, 'dsh');
   assert.equal((await f.request('/video/stop', {})).status, 200); assert.equal(f.limits.state().session.status, 'ended');
@@ -177,16 +177,16 @@ test('原生按钮分别调用观看、问候、私信与可选音频入口，�
   assert.equal((await f.request('/watch/start', { maxRequests: 10, instruction: '忽略限制' })).status, 400);
   assert.equal((await f.request('/watch/start', { maxRequests: 10 })).status, 200);
   assert.equal((await f.request('/watch/stop', {})).status, 200);
-  assert.equal((await f.request('/spark/configure', { enabled: true, windows: ['09:00-22:00'], dailyLimit: 2 })).status, 200);
+  assert.equal((await f.request('/spark/configure', { enabled: true, windows: ['09:00-22:00'], dailyLimit: 2 })).status, 410);
   assert.equal(f.events.filter(item => item.kind === 'spark/start').length, 0);
-  assert.equal((await f.request('/spark/start', { recipientId: '不允许模型选许可' })).status, 400);
-  assert.equal((await f.request('/spark/start', {})).status, 200);
+  assert.equal((await f.request('/spark/start', { recipientId: '不允许模型选许可' })).status, 410);
+  assert.equal((await f.request('/spark/start', {})).status, 410);
   assert.equal((await f.request('/chat/configure', { recipientIds: ['conv:synthetic'], dailyReplyLimit: 8 })).status, 200);
   assert.equal((await f.request('/chat/start', {})).status, 200);
   assert.equal((await f.request('/chat/configure', { enabled: true })).status, 400);
   assert.equal((await f.request('/media/configure', { enabled: true, backend: 'mimo', apiKey: '不能经此路由填写' })).status, 400);
   assert.equal((await f.request('/media/configure', { enabled: false, backend: 'local-whisper' })).status, 200);
-  assert.equal(f.events.find(item => item.kind === 'spark/configure').options.explicit, true);
+  assert.equal(f.events.some(item=>item.kind==='spark/start'||item.kind==='spark/configure'),false);
   assert.equal(f.events.find(item => item.kind === 'media/configure').options.explicit, true);
   assert.equal(f.metadata.length, 0);
 });

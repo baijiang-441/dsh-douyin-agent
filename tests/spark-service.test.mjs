@@ -19,7 +19,7 @@ function fixture(t, options = {}) {
   const now = () => clock;
   const browser = {
     async listContacts() { return { contacts: structuredClone(contacts) }; },
-    async readConversation(id, { signal } = {}) { signal?.throwIfAborted(); reads.push(id); return { conversation: { id }, contact: { id, name: contacts.find(item => item.id === id).name }, messages: structuredClone(messages.get(id)), dayEvidence: { latestEndVerified: true, chronology: 'oldest-first', observedAt: new Date(clock).toISOString(), historyStartVerified: false, emptyTodayVerified: false } }; },
+    async readConversation(id, { signal } = {}) { signal?.throwIfAborted(); reads.push(id); return { conversation: { id }, contact: structuredClone(contacts.find(item => item.id === id)), messages: structuredClone(messages.get(id)), dayEvidence: { latestEndVerified: true, chronology: 'oldest-first', observedAt: new Date(clock).toISOString(), historyStartVerified: false, emptyTodayVerified: false } }; },
     async sendMessage(id, text, settings) {
       settings.signal.throwIfAborted(); await settings.authorize({ phase: 'prepare', recipientId: id }); await settings.authorize({ phase: 'monitor', recipientId: id }); await settings.authorize({ phase: 'before-click', recipientId: id });
       const release = await settings.authorize.beginDispatch();

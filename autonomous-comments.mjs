@@ -88,7 +88,7 @@ export class AutonomousComments {
     const policy = this.policy(), ledger = this.ledger(); if (!policy.enabled) throw fail('自主评论尚未启用。');
     if (this.unresolved(ledger, operationId).length) throw fail('存在未确认评论，已暂停后续发布。');
     const time = this.videoLimits.state();
-    if (!time.allowed || !identifier(time.session?.id) || sessionId && time.session.id !== sessionId) throw fail(time.reason || '有限视频轮次已变化，未继续评论。');
+    if (!time.allowed || time.session?.status !== 'active' || !identifier(time.session?.id) || sessionId && time.session.id !== sessionId) throw fail(time.reason || '有限视频轮次已变化，未继续评论。');
     const worker = read(path.join(this.stateDir, 'watch-loop.lock'), null);
     if (!identifier(watchRunId) || !worker || worker.pid !== process.pid || !alive(worker.pid) || worker.runId !== watchRunId || worker.source !== this.source || worker.sessionId !== time.session.id || worker.status !== 'running') throw fail('评论只能绑定当前入口正在运行的同一自主观看与有限轮次。');
     const request = read(path.join(this.stateDir, 'watch-stop.request.json'), null); if (request?.runId === watchRunId) throw fail('用户已停止自主观看，未继续评论。');

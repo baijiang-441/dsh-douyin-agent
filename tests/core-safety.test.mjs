@@ -24,6 +24,19 @@ const videoMarkup = (id = '111', title = '合成公开作品') => `
     <a href="/user/synthetic-author">合成作者</a>
   </section>`;
 
+test('推荐流从已渲染active feed class核对作品ID，透明旧视频不参与选择',async t=>{
+  const current=videoMarkup('222').replace('data-e2e="feed-active-video"','data-e2e="feed-active-video" class="video_222"').replace('class="video_222">\n      <video','class="">\n      <video');
+  const hidden=videoMarkup('111').replace('<section data-e2e="feed-active-video">','<section style="opacity:0;position:absolute;left:0;top:0">').replace('width:240px;height:320px','width:800px;height:700px');
+  const f=await fixture(t,{url:'https://www.douyin.com/',body:hidden+current}),state=await f.page.evaluate(readPageState);
+  assert.equal(state.video.id,'222');assert.equal(state.videoSelection.candidateCount,1);assert.equal(state.videoSelection.ambiguous,false);
+  assert.equal(await(await f.controller.currentVideo()).evaluate(video=>video.closest('[data-e2e="feed-active-video"]')?.classList.contains('video_222')),true);
+});
+
+test('active feed与播放器ID冲突时保持未知，不取一个猜测身份',async t=>{
+  const f=await fixture(t,{url:'https://www.douyin.com/',body:videoMarkup('111').replace('data-e2e="feed-active-video"','data-e2e="feed-active-video" class="video_222"')}),state=await f.page.evaluate(readPageState);
+  assert.equal(state.video.id,null);assert.equal(state.videoSelection.identityConflict,true);assert.equal(state.videoSelection.ambiguous,true);
+});
+
 function documentHtml(body) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>合成页面测试</title>
     <style>body{margin:0;font:16px sans-serif}section{position:relative;width:260px}video{background:#143447}a,span{display:inline-block}</style>
@@ -65,13 +78,13 @@ async function fixture(t, { url = 'https://www.douyin.com/video/111', body = vid
   return { page, controller, recorded: () => recorded };
 }
 
-test('真实合成视频：没有会话时拒绝播放，并直接暂停已有页面',async t=>{
+test('真实合成视频：未允许观看时拒绝播放，并直接暂停已有页面',async t=>{
   const {page,controller}=await fixture(t);
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'douyin-limits-core-'));
   t.after(()=>{controller.cancelLimitsWatch?.();if(path.dirname(path.resolve(directory))!==path.resolve(os.tmpdir()))throw new Error('测试清理路径越界。');fs.rmSync(directory,{recursive:true,force:true});});
   controller.source='api';controller.limitsEnabled=true;controller.videoLimits=new VideoLimits({stateDir:directory});
   await page.evaluate(()=>{window.name='deepseek-douyin-api';});
-  await assert.rejects(controller.execute('douyin_play'),/开始|一轮/);
+  await assert.rejects(controller.execute('douyin_play'),/允许观看|已关闭/);
   assert.equal(await page.locator('video').evaluate(video=>video.paused),true);
 });
 
@@ -82,7 +95,7 @@ test('真实合成视频：无人继续调用工具时，后台到期检查仍�
   controller.source='api';controller.limitsEnabled=true;controller.videoLimits=new VideoLimits({stateDir:directory,now:()=>now});
   controller.limits().savePolicy({windows:['00:00-24:00'],sessionMinutes:1},{explicit:true});controller.limits().markSession('api',{explicit:true});
   await page.evaluate(()=>{window.name='deepseek-douyin-api';});await controller.execute('douyin_play');
-  assert.equal(await page.locator('video').evaluate(video=>video.paused),false);now+=61_000;
+  assert.equal(await page.locator('video').evaluate(video=>video.paused),false);for(let second=0;second<61;second++){controller.videoLimits.notePlayback('api',{video:{paused:false,readyState:4}});now+=1000;}
   await page.waitForFunction(()=>document.querySelector('video').paused,{},{timeout:3500});
   assert.equal(controller.limits().state().allowed,false);
 });

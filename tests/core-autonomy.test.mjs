@@ -174,7 +174,7 @@ test('无有效视频轮次时仍只读返回共享自主状态，不触浏览�
   for (const controller of controllers) {
     const status = await controller.execute('douyin_watch_status');
     assert.equal(status.protocol, 'autonomous-watch-v1'); assert.equal(status.running, false); assert.equal(status.remainingSeconds, 0);
-    assert.equal(status.counts.requests, 0); assert.equal(status.counts.maxRequests, 30);
+    assert.equal(status.counts.requests, 0); assert.equal(status.counts.maxRequests, null); assert.equal(status.counts.dailyLimit, 30);
   }
   assert.deepEqual(fs.readdirSync(f.root, { recursive: true }).sort(), before);
 
@@ -189,7 +189,7 @@ test('无有效视频轮次时仍只读返回共享自主状态，不触浏览�
   for (const controller of controllers) {
     const status = await controller.execute('douyin_watch_status');
     assert.equal(status.running, true); assert.equal(status.owned, false); assert.equal(status.worker.runId, runId); assert.equal(status.worker.source, 'dsh');
-    assert.equal(status.counts.requests, 7); assert.equal(status.counts.maxRequests, 9); assert.equal(status.counts.dailyRequests, 7);
+    assert.equal(status.counts.requests, 7); assert.equal(status.counts.maxRequests, null); assert.equal(status.counts.dailyRequests, 7);
     assert.equal(status.lastDecision.reason, '合成来源状态'); assert.equal(status.remainingSeconds, 0);
     assert.equal(controller.browser, null); assert.equal(controller.memory, undefined);
   }

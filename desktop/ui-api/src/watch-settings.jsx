@@ -1,23 +1,30 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Button, Input, Switch, Tag, MarkdownText } from '@dsh/primitives';
+import { useAutoSave, AutoSaveStatus } from './use-auto-save.jsx';
 
 export function SilentPanel({ state, connected, api, run, busy }) {
-  const [silent, setSilent] = useState(false), dirty = useRef(false);
   const ready = connected && state?.protocol === 'watch-mode-v1';
-  useEffect(() => { if (ready && !dirty.current) setSilent(state.silent); }, [ready, state]);
+  const save = useAutoSave({ value: ready ? state : null, initial: { silent: false }, read: value => ({ silent: value.silent === true }), encode: draft => ({ silent: draft.silent }), write: payload => api('/api/mode/configure', payload), available: ready });
   return <section className="watch-controls" aria-label="静默观看设置"><h3>静默观看</h3>
-    <div className="switch-row"><span>静音并最小化专用视频窗口</span><Switch label="静默观看" checked={silent} disabled={!ready || busy.has('modeSave')} onChange={value => { dirty.current = true; setSilent(value); }} /></div>
-    <Button size="sm" disabled={!ready || busy.has('modeSave')} onClick={() => { void run('modeSave', async () => { await api('/api/mode/configure', { silent }); dirty.current = false; }); }}>保存静默设置</Button>
+    <div className="switch-row"><span>静音并最小化专用视频窗口</span><Switch label="静默观看" checked={save.draft.silent} disabled={!ready} onChange={value => save.edit({ silent: value }, { immediate: true })} /></div>
+    <AutoSaveStatus status={save.status} />
     <p className="notice">{ready ? state.note : '静默状态尚未核实，请等待服务回读。'} 静默观看仍受原视频时段和单轮上限约束。</p>
-    {ready && state.silent && <p className="notice" role="status">{state.application?.message || '静默开关已开启，尚未确认当前窗口是否已最小化；可点击保存重新应用。'}</p>}
+    {ready && state.silent && <p className="notice" role="status">{state.application?.message || '静默开关已开启，尚未确认当前窗口是否已最小化；可用一键自检检查并重新应用。'}</p>}
   </section>;
 }
 
 export function CommentsPanel({ state, connected, api, run, busy }) {
-  const [enabled, setEnabled] = useState(false), [daily, setDaily] = useState(3), [session, setSession] = useState(1), [submitted, setSubmitted] = useState(new Set());
-  const dirty = useRef(false), resolving = useRef(new Set());
+  const [submitted, setSubmitted] = useState(new Set());
+  const resolving = useRef(new Set());
   const ready = connected && state?.protocol === 'autonomous-comments-v1';
-  useEffect(() => { if (ready && !dirty.current) { setEnabled(state.policy.enabled); setDaily(state.policy.dailyLimit); setSession(state.policy.perSessionLimit); } }, [ready, state]);
+  const save = useAutoSave({ value: ready ? state.policy : null, initial: { enabled: false, daily: 3, session: 1 }, read: value => ({ enabled: value.enabled, daily: value.dailyLimit, session: value.perSessionLimit }), encode: draft => {
+    const daily = Number(draft.daily), session = Number(draft.session), result = { enabled: draft.enabled };
+    if (String(draft.daily).trim() && Number.isSafeInteger(daily) && daily >= 1 && daily <= 20) result.dailyLimit = daily;
+    else if (draft.enabled) throw new Error('评论每日上限须填写1至20的整数。');
+    if (String(draft.session).trim() && Number.isSafeInteger(session) && session >= 1 && session <= 3) result.perSessionLimit = session;
+    else if (draft.enabled) throw new Error('评论每轮上限须填写1至3的整数。');
+    return result;
+  }, write: payload => api('/api/comments/configure', payload), available: ready });
   async function resolve(operationId, outcome) {
     if (resolving.current.has(operationId)) return;
     resolving.current.add(operationId);
@@ -25,12 +32,10 @@ export function CommentsPanel({ state, connected, api, run, busy }) {
     catch (error) { resolving.current.delete(operationId); throw error; }
   }
   return <section className="panel" aria-label="自主评论设置"><div className="panel-title"><h2>自主公开评论</h2><Tag>{state?.paused ? '待人工核对' : state?.enabled ? '已许可' : '未启用'}</Tag></div>
-    <form onSubmit={event => { event.preventDefault(); void run('commentsSave', async () => { await api('/api/comments/configure', { enabled, dailyLimit: Number(daily), perSessionLimit: Number(session) }); dirty.current = false; }); }}>
-      <div className="switch-row"><span>允许大肥鱼自主发布评论</span><Switch label="允许自主发布评论" checked={enabled} disabled={!ready} onChange={value => { dirty.current = true; setEnabled(value); }} /></div>
-      <label className="field"><span>评论每日尝试上限</span><Input aria-label="评论每日尝试上限" type="number" min={1} max={20} required value={daily} disabled={!ready} onChange={event => { dirty.current = true; setDaily(event.target.value); }} /></label>
-      <label className="field"><span>评论每轮尝试上限</span><Input aria-label="评论每轮尝试上限" type="number" min={1} max={3} required value={session} disabled={!ready} onChange={event => { dirty.current = true; setSession(event.target.value); }} /></label>
-      <Button size="sm" type="submit" disabled={!ready || busy.has('commentsSave')}>保存评论许可</Button>
-    </form>
+    <div className="switch-row"><span>允许大肥鱼自主发布评论</span><Switch label="允许自主发布评论" checked={save.draft.enabled} disabled={!ready} onChange={value => save.edit({ enabled: value }, { immediate: true })} /></div>
+    <label className="field"><span>评论每日尝试上限</span><Input aria-label="评论每日尝试上限" type="number" min={1} max={20} required value={save.draft.daily} disabled={!ready} onChange={event => save.edit({ daily: event.target.value })} /></label>
+    <label className="field"><span>评论每轮尝试上限</span><Input aria-label="评论每轮尝试上限" type="number" min={1} max={3} required value={save.draft.session} disabled={!ready} onChange={event => save.edit({ session: event.target.value })} /></label>
+    <AutoSaveStatus status={save.status} />
     <p className="notice">{ready ? `今日已尝试 ${state.daily?.attempts || 0} 次。` : '评论状态尚未核实，请等待服务回读。'} 仅在有限自主观看中根据实际观察决定是否评论；不使用人格原文、私信或 QQ 内容。保存许可不会立即发布。</p>
     {(state?.needsReview || []).map(item => <div className="paused-contact" key={item.operationId}><strong>评论结果需要人工核对</strong><p>作品 {item.videoId}；请在抖音确认实际发布情况，不会自动重发。</p>{submitted.has(item.operationId) ? <p>核对结果已提交，等待回读。</p> : <div className="actions"><Button size="sm" disabled={!ready || state.busy || busy.has(`commentReview-${item.operationId}`)} onClick={() => { void run(`commentReview-${item.operationId}`, () => resolve(item.operationId, 'confirmed')); }}>已核对评论已发布</Button><Button size="sm" disabled={!ready || state.busy || busy.has(`commentReview-${item.operationId}`)} onClick={() => { void run(`commentReview-${item.operationId}`, () => resolve(item.operationId, 'not-sent')); }}>已核对评论未发布</Button></div>}</div>)}
   </section>;

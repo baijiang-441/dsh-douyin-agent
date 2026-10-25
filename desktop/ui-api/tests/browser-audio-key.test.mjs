@@ -23,6 +23,7 @@ test('未配置主 Key 也可点击打开抖音；MiMo Key 只走桌面接口且
         if (url.pathname === '/api/video/status') return reply({ allowed: false, policy: { windows: ['00:00-24:00'], sessionMinutes: 21 }, reason: '合成未开始轮次' });
         if (url.pathname === '/api/chat/state') return reply({ running: false, policy: { allowlist: [], dailyReplyLimit: 40 } });
         if (url.pathname === '/api/media/state') return reply({ enabled: false, backend: 'local-whisper', backends: { mimo: { available: mimoConfigured } } });
+        if (url.pathname === '/api/media/configure') return reply({ ...JSON.parse(body), backends: { mimo: { available: mimoConfigured } } });
         if (url.pathname === '/api/browser/open') {
           if (rejectOpen) { rejectOpen = false; response.writeHead(503, { 'content-type': 'application/json' }); return response.end(JSON.stringify({ error: '合成连接未就绪，请重试。' })); }
           return reply({ opened: true, mode: 'prepare', paused: true, sessionChanged: false });
@@ -54,17 +55,17 @@ test('未配置主 Key 也可点击打开抖音；MiMo Key 只走桌面接口且
   assert.equal(calls.find(call => call.route === '/api/browser/open').body, '{}');
   assert.equal(configured, false); assert.deepEqual(native, []);
   await dialog.getByRole('textbox', { name: 'API Key', exact: true }).fill('synthetic-main-key');
-  await dialog.getByRole('button', { name: '保存并连接', exact: true }).click(); await dialog.waitFor({ state: 'hidden' });
+  await dialog.getByRole('textbox', { name: 'API Key', exact: true }).press('Tab'); await dialog.waitFor({ state: 'hidden' });
   await page.getByRole('button', { name: /◌ 对话与视频/ }).click();
   await page.getByRole('button', { name: '展开快捷控制', exact: true }).click();
   await page.getByLabel('音频后端', { exact: true }).selectOption('mimo');
   const key = page.getByRole('textbox', { name: 'MiMo API Key', exact: true });
   assert.equal(await key.getAttribute('type'), 'password');
-  await key.fill('synthetic-mimo-key'); await page.getByRole('button', { name: '保存音频 Key', exact: true }).click();
-  await page.getByText('已保存共享音频 Key。保存不会开启音频或发起云端请求。', { exact: true }).waitFor();
+  await key.fill('synthetic-mimo-key'); await key.press('Tab');
+  await page.getByText('共享音频 Key 已保存；不会自动开启音频。', { exact: true }).waitFor();
   assert.equal(await key.inputValue(), '');
   assert.deepEqual(native.find(value => value.kind === 'media').input, { backend: 'mimo', apiKey: 'synthetic-mimo-key' });
-  assert.equal(calls.filter(call => call.method === 'POST').every(call => call.route === '/api/browser/open'), true);
+  assert.equal(calls.filter(call => call.method === 'POST').every(call => ['/api/browser/open','/api/media/configure'].includes(call.route)), true);
   assert.doesNotMatch(JSON.stringify(calls), /synthetic-main-key|synthetic-mimo-key/);
   assert.equal(await page.getByRole('switch', { name: '读取视频声音', exact: true }).getAttribute('aria-checked'), 'false');
   const screenshots = fileURLToPath(new URL('../.test-temp/browser-audio/', import.meta.url)); await fs.mkdir(screenshots, { recursive: true });

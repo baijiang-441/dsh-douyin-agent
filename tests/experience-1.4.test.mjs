@@ -16,21 +16,21 @@ function fixture(t, time = '2026-10-23T12:00:00Z') {
   const options = { stateDir, now: () => clock };
   return { ...options, video: new VideoLimits(options), ledger: new UsageLedger(options), topics: new WatchOptions(options), advance: ms => { clock += ms; } };
 }
-test('不限单轮时长可跨月读取和手动停止；保存不限时长不会延长旧轮次', t => {
+test('不限每日时长可跨月读取，内部运行结束不重置用量或替代总允许开关', t => {
   const f = fixture(t); f.video.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: null }, { explicit: true });
   const state = f.video.markSession('dsh', { explicit: true }); assert.equal(state.session.expiresAt, null); assert.equal(state.remainingSeconds, null);
   assert.equal(JSON.parse(JSON.stringify(state)).session.expiresAt, null);
-  f.advance(40 * 86400000); assert.equal(new VideoLimits(f).state().allowed, true); f.video.endSession({ explicit: true }); assert.equal(f.video.state().allowed, false);
+  f.advance(40 * 86400000); assert.equal(new VideoLimits(f).state().allowed, true); f.video.endSession({ explicit: true });assert.equal(f.video.state().session.status,'ended');assert.equal(f.video.state().allowed,true);f.video.savePolicy({enabled:false},{explicit:true});assert.equal(f.video.state().allowed,false);
   f.video.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: 10 }, { explicit: true }); const old = f.video.markSession('api', { explicit: true });
   f.video.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: null }, { explicit: true }); assert.equal(f.video.state().session.expiresAt, old.session.expiresAt);
 });
-test('不限单轮时长仍按跨夜时段截止；长轮次不被三日窗口或32位定时器截断', t => {
+test('不限每日时长仍按跨夜时段截止，大数每日额度不受旧轮次或定时器cap影响', t => {
   const f = fixture(t, '2026-10-23T15:30:00Z');
   f.video.savePolicy({ windows: ['23:00-01:00'], sessionMinutes: null }, { explicit: true }); const state = f.video.markSession('api', { explicit: true });
   assert.equal(state.session.expiresAt, Date.parse('2026-10-23T17:00:00Z')); f.advance(90 * 60000); assert.equal(f.video.state().allowed, false);
   f.video.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: 1000000 }, { explicit: true }); const long = f.video.markSession('api', { explicit: true });
   f.advance(31 * 86400000); assert.equal(f.video.state().allowed, true); assert.equal(f.video.state().session.expiresAt, long.session.expiresAt);
-  assert.throws(() => validateVideoPolicy({ windows: ['00:00-24:00'], sessionMinutes: 1000001 }));
+  assert.equal(validateVideoPolicy({windows:['00:00-24:00'],dailyMinutes:1000001,dailyRequests:null}).dailyMinutes,1000001);
 });
 test('谷时段工作日避开高峰、周末全天，星期五晚可跨周末连续到周一上午', () => {
   const policy = validateVideoPolicy({ windows: ['00:00-09:00','12:00-14:00','18:00-24:00'], weekendWindows: ['00:00-24:00'], sessionMinutes: null });

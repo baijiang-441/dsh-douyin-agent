@@ -8,6 +8,7 @@ import { analyzeConversationDay } from './chat-browser.mjs?v=9';
 import { OutboundCoordinator } from './outbound-send.mjs';
 import { SparkAgent } from './spark-agent.mjs?v=9';
 import { loadApiConfig, redact } from './api-agent.mjs';
+import { isStoredContactAuthorized, matchesAuthorizedContact } from './contact-authorization.mjs';
 
 const defaults = () => ({ version: 1, enabled: false, timeZone: 'Asia/Shanghai', windows: ['09:00-22:00'], dailyLimit: 2 });
 const emptyLedger = () => ({ version: 1, operations: [], contacts: {}, lastError: '' });
@@ -29,8 +30,8 @@ function validatePolicy(value) {
   const time = validateVideoPolicy({ windows: value.windows, sessionMinutes: 1, timeZone: value.timeZone });
   return { version: 1, enabled: value.enabled, timeZone: value.timeZone, windows: time.windows, dailyLimit: value.dailyLimit };
 }
-function snapshotMessages(snapshot, recipientId) {
-  if (snapshot?.blocked || snapshot?.loginRequired || snapshot?.verificationRequired || (snapshot?.conversation?.id || snapshot?.contact?.id) !== recipientId || !Array.isArray(snapshot?.messages)) throw fail('私信登录状态或会话身份未通过核对，未发送问候。');
+function snapshotMessages(snapshot, contact) {
+  if (snapshot?.blocked || snapshot?.loginRequired || snapshot?.verificationRequired || snapshot?.conversation?.id !== contact.id || !matchesAuthorizedContact(contact, snapshot?.contact) || typeof snapshot.conversation.isGroup === 'boolean' && snapshot.conversation.isGroup !== contact.isGroup || !Array.isArray(snapshot?.messages)) throw Object.assign(fail('私信登录状态、会话身份或许可绑定未通过核对，未发送问候。', 'SPARK_CONTACT_CHANGED'), { beforeDelivery: true });
   const messages = snapshot.messages;
   if (messages.some(item => !item || typeof item.id !== 'string' || !item.id || !['incoming', 'outgoing'].includes(item.sender || item.direction)) || new Set(messages.map(item => item.id)).size !== messages.length) throw fail('私信消息身份或方向不可靠，未发送问候。');
   return messages;
@@ -71,8 +72,8 @@ export class SparkService {
   recipients() {
     const policy = read(path.join(this.stateDir, 'chat-policy.json'), { allowlist: [] });
     const list = policy?.allowlist;
-    if (!Array.isArray(list) || list.length > 2 || new Set(list.map(item => item?.id)).size !== list.length || list.some(item => !item || !recipientPattern.test(item.id) || item.followed !== true || item.isGroup !== false || !Number.isFinite(Date.parse(item.verifiedAt)) || typeof item.name !== 'string' || !item.name.trim())) throw fail('现有两位好友许可名单未通过核对。');
-    return list.map(({ id, name }) => ({ id, name }));
+    if (!Array.isArray(list) || new Set(list.map(item => item?.id)).size !== list.length || list.some(item => !item || !recipientPattern.test(item.id) || !isStoredContactAuthorized(item))) throw fail('现有许可名单未通过核对。');
+    return list.filter(item => item.isGroup === false).map(item => ({ ...item }));
   }
   acquireControl() {
     fs.mkdirSync(this.stateDir, { recursive: true });
@@ -127,7 +128,7 @@ export class SparkService {
     if (this.starting || this.busy) throw fail('续火花正在启动或停止，请稍后重试。');
     if (!this.policy().enabled) throw fail('请先在本机开启自动续火花许可。');
     if (!this.config?.apiKey && !this.greetingProvider) throw fail('未配置问候模型或 API Key。');
-    const recipients = this.recipients(); if (recipients.length !== 2) throw fail('续火花仅沿用当前已核对的两位许可好友，请先核对名单。');
+    const recipients = this.recipients(); if (recipients.length < 1) throw fail('续火花需要至少一位已核对的许可个人联系人，群聊不参与续火花。');
     this.control(() => {
       const worker = this.worker(); if (worker?.alive) throw fail('另一个入口已经运行续火花调度，请使用状态或停止入口。');
       const ledger = this.recover(this.ledger()); write(this.files.ledger, ledger);
@@ -141,7 +142,7 @@ export class SparkService {
     try {
       const list = await this.browser.listContacts({ verifyFollowing: true, signal: this.abort.signal });
       this.abort.signal.throwIfAborted(); this.assertOwned();
-      if (list.blocked || list.loginRequired || list.verificationRequired || recipients.some(contact => !list.contacts?.some(item => item.id === contact.id && (item.name || item.displayName) === contact.name && item.followed === true && item.isGroup === false))) throw fail('当前好友身份或关注关系未通过核对，未开始调度。');
+      if (list.blocked || list.loginRequired || list.verificationRequired || recipients.some(contact => !list.contacts?.some(item => matchesAuthorizedContact(contact, item)))) throw fail('当前好友身份或授权关系未通过核对，未开始调度。');
       this.control(() => { this.assertOwned(); if (!this.policy().enabled || read(this.files.stop, null)?.targetRunId === this.runId) throw fail('续火花启动许可已撤回。'); write(this.files.loop, { pid: process.pid, source: this.source, runId: this.runId, status: 'running', heartbeatAt: new Date(this.now()).toISOString() }); });
       this.running = true;
       if (schedule) { this.timer = setInterval(() => { void this.tick().catch(() => {}); }, this.pollIntervalMs); this.timer.unref?.(); }
@@ -188,12 +189,14 @@ export class SparkService {
     if (!Array.isArray(forward?.operations)) throw fail('视频转发收据不可读，未发送问候。');
     if (forward.operations.some(item => item.recipientId === recipientId && ['clicking', 'uncertain'].includes(item.status))) throw fail('这位好友有未确认的视频转发，需要先人工核对。');
   }
-  allowed(recipientId, operationId, signal) {
+  allowed(recipientId, operationId, signal, expectedContact) {
     signal?.throwIfAborted(); this.assertOwned();
     if (!this.running || read(this.files.stop, null)?.targetRunId === this.runId) throw fail('续火花调度已停止，未继续发送。');
     const policy = this.policy(), ledger = this.ledger();
     if (!policy.enabled || !allowedWindow(policy, this.now())) throw fail('当前未获续火花许可或不在允许时间段。');
-    if (!this.recipients().some(item => item.id === recipientId)) throw fail('好友已不在许可名单。');
+    const currentContact = this.recipients().find(item => item.id === recipientId);
+    if (!currentContact) throw Object.assign(fail('好友已不在许可名单。'), { beforeDelivery: true });
+    if (expectedContact && !matchesAuthorizedContact(expectedContact, currentContact)) throw Object.assign(fail('好友的许可身份或绑定已改变，未继续问候。', 'SPARK_CONTACT_CHANGED'), { beforeDelivery: true });
     if (this.unresolved(ledger).length) throw fail('有发送结果需要人工核对，未继续问候。');
     const date = day(this.now()), own = operationId && ledger.operations.find(item => item.operationId === operationId);
     if (own && (own.day !== date || own.recipientId !== recipientId || own.runId !== this.runId || !['reserved', 'sending'].includes(own.status))) throw fail('问候预留与当前日期或调度不一致。');
@@ -228,31 +231,31 @@ export class SparkService {
       signal.throwIfAborted();
       if (this.ledger().operations.some(item => item.recipientId === contact.id && item.day === day(this.now()))) continue;
       if (this.ledger().operations.filter(item => item.day === day(this.now())).length >= this.policy().dailyLimit) break;
-      this.allowed(contact.id, null, signal);
+      this.allowed(contact.id, null, signal, contact);
       const history = this.coordinator.history(contact.id);
       const before = await this.browser.readConversation(contact.id, { allowed: true, signal });
-      const messages = snapshotMessages(before, contact.id);
+      const messages = snapshotMessages(before, contact);
       const analysis = analyzeConversationDay(before, { now: this.now, confirmedHistory: history });
       if (analysis.status !== 'eligible') { this.check(contact.id, analysis.status, analysis.reason); continue; }
       let operationId;
       this.control(() => {
-        const { ledger, date } = this.allowed(contact.id, null, signal);
+        const { ledger, date } = this.allowed(contact.id, null, signal, contact);
         operationId = randomUUID(); ledger.operations.push({ operationId, recipientId: contact.id, day: date, status: 'reserved', source: this.source, pid: process.pid, runId: this.runId, startedAt: new Date(this.now()).toISOString() }); write(this.files.ledger, ledger);
       });
       try {
         Object.assign(this.agent, { config: this.config, personaMemory: this.personaMemory, greetingProvider: this.greetingProvider });
         const greeting = await this.agent.greet({ date: day(this.now()), signal });
-        this.allowed(contact.id, operationId, signal);
+        this.allowed(contact.id, operationId, signal, contact);
         const delivery = await this.coordinator.run({ recipientId: contact.id, purpose: 'spark', signal }, async () => {
-          this.allowed(contact.id, operationId, signal);
+          this.allowed(contact.id, operationId, signal, contact);
           const latest = await this.browser.readConversation(contact.id, { allowed: true, signal });
-          const current = snapshotMessages(latest, contact.id);
+          const current = snapshotMessages(latest, contact);
           const checked = analyzeConversationDay(latest, { now: this.now, confirmedHistory: this.coordinator.history(contact.id) });
           if (checked.status !== 'eligible' || signature(current) !== signature(messages)) return { confirmed: false, deliveryUncertain: false, reason: checked.status === 'eligible' ? '生成问候期间消息发生变化，本次未发送。' : checked.reason };
-          const authorize = async () => { this.allowed(contact.id, operationId, signal); return true; };
-          authorize.beginDispatch = () => { const release = this.acquireControl(); try { this.allowed(contact.id, operationId, signal); return release; } catch (error) { release(); throw error; } };
+          const authorize = async () => { this.allowed(contact.id, operationId, signal, contact); return true; };
+          authorize.beginDispatch = () => { const release = this.acquireControl(); try { this.allowed(contact.id, operationId, signal, contact); return release; } catch (error) { release(); throw error; } };
           this.update(operationId, { status: 'sending' });
-          const result = await this.browser.sendMessage(contact.id, greeting.text, { allowed: true, signal, authorize, expectedMessageIds: current.map(item => item.id), expectedMessageContent: current.map(item => ({ id: item.id, fingerprint: messageFingerprint(item) })) });
+          const result = await this.browser.sendMessage(contact.id, greeting.text, { allowed: true, signal, authorize, expectedContact: contact, expectedMessageIds: current.map(item => item.id), expectedMessageContent: current.map(item => ({ id: item.id, fingerprint: messageFingerprint(item) })) });
           if (result?.confirmed === true && (result.deliveryUncertain === true || typeof result.messageId !== 'string' || !result.messageId.trim() || (result.conversation?.id || result.contact?.id) !== contact.id)) return { confirmed: false, deliveryUncertain: true, reason: '问候回执的联系人或消息凭据不完整，需要人工核对。' };
           return result;
         });

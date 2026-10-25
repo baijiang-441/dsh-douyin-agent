@@ -1,4 +1,5 @@
 import { ScheduledWatch } from './scheduled-watch.mjs';
+import { FriendInteractions } from './friend-interactions.mjs';
 import { interactionStatus } from './interaction-status.mjs';
 import { SETTINGS_SECTIONS } from './settings-sections.mjs';
 import http from 'node:http';
@@ -18,6 +19,7 @@ import { UsageLedger } from './usage-ledger.mjs';
 import { WatchOptions } from './watch-options.mjs';
 import { DiagnosticsService } from './diagnostics.mjs';
 import { DailyReport } from './daily-report.mjs';
+import { isStoredContactAuthorized, matchesAuthorizedContact } from './contact-authorization.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -72,13 +74,16 @@ async function staticAsset(root, pathname) {
   } catch (error) { if (['ENOENT', 'ENOTDIR'].includes(error.code)) return null; throw error; }
 }
 
-export function createApiServer({ controller, config, personaMemory, watchService, shareService, sparkService, commentService, reportService, modeService, taskLimits, agent = new ApiAgent({ controller, config, personaMemory }), chatService, videoLimits, pauseVideoSources, mediaAdapter, watchSchedule, port = 3218, htmlFile = path.join(ROOT, 'public/index.html'), staticRoot } = {}) {
+export function createApiServer({ controller, config, personaMemory, watchService, shareService, sparkService, commentService, reportService, modeService, taskLimits, agent = new ApiAgent({ controller, config, personaMemory }), chatService, videoLimits, pauseVideoSources, mediaAdapter, watchSchedule, friendInteractions, port = 3218, htmlFile = path.join(ROOT, 'public/index.html'), staticRoot } = {}) {
   if (staticRoot !== undefined && (typeof staticRoot !== 'string' || !path.isAbsolute(staticRoot))) throw new Error('静态资源目录必须是绝对路径。');
   const stateDir = videoLimits?.stateDir ?? resolveRuntimePaths().stateDir;
   const usageLedger = new UsageLedger({ stateDir }), optionsService = watchService?.optionsService || new WatchOptions({ stateDir });
   agent.usageLedger = usageLedger;
   for (const service of [chatService, sparkService]) if (service?.agent) { service.agent.usageLedger = usageLedger; service.agent.source = 'api'; }
-  watchSchedule ??= new ScheduledWatch({ stateDir, source: 'api', getVideoLimits: async () => videoLimits, getWatchState: async () => watchService?.state(), startRound: async ({maxRequests,signal}) => { signal.throwIfAborted(); return watchService.start({startSession:true,maxRequests},{explicit:true}); } });
+  watchSchedule ??= new ScheduledWatch({ stateDir, source: 'api', getVideoLimits: async () => videoLimits, getWatchState: async () => watchService?.state(), stopWatch: async () => watchService?.stop({explicit:true}), startRound: async ({signal}) => { signal.throwIfAborted(); return watchService.start({startSession:true},{explicit:true}); } });
+  friendInteractions ??= new FriendInteractions({ stateDir, getChat:()=>chatService, getShare:()=>shareService, getSpark:()=>sparkService, modelReady:()=>Boolean(config.apiKey) });
+  const interactionSnapshot = () => { const friend=friendInteractions.state(); return interactionStatus({friend,chat:chatService?.state(),share:shareService?.state(),comments:commentService?.state(),watch:watchService?.state(),modelReady:Boolean(config.apiKey)}); };
+  const usageSnapshot = () => { const watch=watchService?.state(),chat=chatService?.state(),pendingChat=chat?.contacts?.filter(item=>item.pending?.phase==='model').length||0; return {...usageLedger.state(),checkedAt:new Date().toISOString(),inProgress:{watch:watch?.pendingRequests||0,chat:pendingChat,total:(watch?.pendingRequests||0)+pendingChat},videoDaily:videoLimits?.state().daily||null}; };
   const diagnostics = new DiagnosticsService({ source: 'api', controller, modeService, videoLimits, watchService, watchSchedule, optionsService, usageLedger,
     modelConfigured: () => Boolean(config.apiKey), paths: { ...resolveRuntimePaths(), stateDir },
     interactionStates: () => ({ chat: chatService?.state(), spark: sparkService?.state(), comments: commentService?.state() }),
@@ -122,7 +127,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
       if (request.method === 'GET' && url.pathname === '/') return reply(response, 200, await fs.readFile(htmlFile), 'text/html; charset=utf-8');
       if (request.method === 'GET' && url.pathname === '/api/bootstrap') {
         const memory = resolveRuntimePaths();
-        return reply(response, 200, { service: 'douyin-api-local', version: 1, sections: SETTINGS_SECTIONS, token, videoTime: { enabled: Boolean(videoLimits) }, media: { available: Boolean(mediaAdapter) }, watch: { available: Boolean(watchService) }, share: { available: Boolean(shareService) }, spark: { available: Boolean(sparkService) }, comments: { available: Boolean(commentService) }, reports: { available: Boolean(reportService) }, mode: { available: Boolean(modeService) }, persona: { available: Boolean(personaMemory) }, forward: { available: Boolean(chatService && videoLimits) }, config: redact(publicApiConfig(config), [config.apiKey]), limits: { maxSteps: agent.maxSteps ?? DEFAULT_LIMITS.maxSteps, maxToolCalls: agent.maxToolCalls ?? DEFAULT_LIMITS.maxToolCalls, taskTimeoutSeconds: (agent.taskTimeoutMs ?? DEFAULT_LIMITS.taskTimeoutMs) / 1_000, apiTimeoutSeconds: (agent.apiTimeoutMs ?? DEFAULT_LIMITS.apiTimeoutMs) / 1_000, maxTokens: agent.maxTokens ?? DEFAULT_LIMITS.maxTokens, maxFrames: agent.maxFrames ?? DEFAULT_LIMITS.maxFrames }, memory: { description: '与 QQ 机器人共享的记忆 / 视频笔记。具体连通状态以检索结果为准。', folder: memory.memoryDir, database: memory.memoryDbPath } });
+        return reply(response, 200, { service: 'douyin-api-local', version: 1, sections: SETTINGS_SECTIONS, token, videoTime: { enabled: Boolean(videoLimits) }, media: { available: Boolean(mediaAdapter) }, watch: { available: Boolean(watchService) }, share: { available: Boolean(shareService) }, spark: { available: false }, comments: { available: Boolean(commentService) }, reports: { available: Boolean(reportService) }, mode: { available: Boolean(modeService) }, persona: { available: Boolean(personaMemory) }, forward: { available: Boolean(chatService && videoLimits) }, config: redact(publicApiConfig(config), [config.apiKey]), limits: { maxSteps: agent.maxSteps ?? DEFAULT_LIMITS.maxSteps, maxToolCalls: agent.maxToolCalls ?? DEFAULT_LIMITS.maxToolCalls, taskTimeoutSeconds: (agent.taskTimeoutMs ?? DEFAULT_LIMITS.taskTimeoutMs) / 1_000, apiTimeoutSeconds: (agent.apiTimeoutMs ?? DEFAULT_LIMITS.apiTimeoutMs) / 1_000, maxTokens: agent.maxTokens ?? DEFAULT_LIMITS.maxTokens, maxFrames: agent.maxFrames ?? DEFAULT_LIMITS.maxFrames }, memory: { description: '与 QQ 机器人共享的记忆 / 视频笔记。具体连通状态以检索结果为准。', folder: memory.memoryDir, database: memory.memoryDbPath } });
       }
       if (request.method === 'GET' && !url.pathname.startsWith('/api/') && staticRoot) {
         const asset = await staticAsset(staticRoot, url.pathname);
@@ -130,13 +135,14 @@ export function createApiServer({ controller, config, personaMemory, watchServic
       }
       if (!url.pathname.startsWith('/api/')) return reply(response, 404, { error: '地址不存在。' });
       if (!tokenMatches(request.headers['x-session-token'], token)) return reply(response, 403, { error: '控制台会话校验失败，请刷新页面。' });
-      if (url.pathname === '/api/interactions/state' && request.method === 'GET') return reply(response, 200, interactionStatus({chat:chatService?.state(),spark:sparkService?.state(),share:shareService?.state(),comments:commentService?.state(),watch:watchService?.state(),modelReady:Boolean(config.apiKey)}));
-      if (url.pathname === '/api/usage' && request.method === 'GET') return reply(response, 200, usageLedger.state());
+      if (url.pathname === '/api/interactions/state' && request.method === 'GET') return reply(response, 200, interactionSnapshot());
+      if (url.pathname === '/api/interactions/configure' && request.method === 'POST') { await friendInteractions.configure(await readJson(request),{explicit:true}); return reply(response,200,interactionSnapshot()); }
+      if (url.pathname === '/api/usage' && request.method === 'GET') return reply(response, 200, usageSnapshot());
       if (url.pathname === '/api/diagnostics' && request.method === 'POST') { const body = await readJson(request); if (Object.keys(body).length) return reply(response, 400, { error: '自检不接收参数。' }); return reply(response, 200, await diagnostics.run()); }
       if (url.pathname === '/api/diagnostics/repair' && request.method === 'POST') return reply(response, 200, await diagnostics.repair(await readJson(request)));
       if (url.pathname === '/api/watch/options') {
         if (request.method === 'GET') return reply(response, 200, optionsService.state());
-        if (request.method === 'POST') { if (watchService?.state().running) return reply(response, 409, { error: '请先停止自主观看再保存主题。' }); return reply(response, 200, optionsService.configure(await readJson(request), { explicit: true })); }
+        if (request.method === 'POST') return reply(response, 200, optionsService.configure(await readJson(request), { explicit: true }));
       }
       if (url.pathname.startsWith('/api/comments/')) {
         if (!commentService) return reply(response, 503, { error: '自主评论服务尚未就绪。' });
@@ -182,6 +188,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
         return reply(response, 404, { error: '静默模式接口不存在。' });
       }
       if (url.pathname.startsWith('/api/spark/')) {
+        if(url.pathname==='/api/spark/start'||url.pathname==='/api/spark/configure') return reply(response,410,{error:'自动续火花功能已移除。'});
         if (!sparkService) return reply(response, 503, { error: '自动续火花服务尚未就绪。' });
         if (request.method === 'GET' && url.pathname === '/api/spark/state') return reply(response, 200, redact(sparkService.state(), [config.apiKey]));
         if (request.method === 'POST') {
@@ -214,7 +221,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
       if (url.pathname.startsWith('/api/share/')) {
         if (!shareService) return reply(response, 503, { error: '自主分享模块尚未就绪。' });
         if (request.method === 'GET' && url.pathname === '/api/share/state') return reply(response, 200, redact(shareService.state(), [config.apiKey]));
-        if (request.method === 'POST' && url.pathname === '/api/share/configure') return reply(response, 200, redact(shareService.configure(await readJson(request), { explicit: true }), [config.apiKey]));
+        if (request.method === 'POST' && url.pathname === '/api/share/configure') { const body=await readJson(request); if(Object.keys(body).some(key=>!['enabled','dailyLimit'].includes(key)))return reply(response,400,{error:'好友互动只接受总开关。'}); await friendInteractions.configure({enabled:body.enabled},{explicit:true}); return reply(response,200,redact(shareService.state(),[config.apiKey])); }
         if (request.method === 'POST' && url.pathname === '/api/share/resolve') {
           const body = await readJson(request);
           if (Object.keys(body).some(key => !['operationId', 'outcome'].includes(key))) return reply(response, 400, { error: '核对记录只接受记录编号和实际发送结果。' });
@@ -239,7 +246,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
         if (request.method === 'GET' && url.pathname === '/api/watch/state') return reply(response, 200, watchService.state());
         if (request.method === 'POST') {
           const body = await readJson(request);
-          if (url.pathname === '/api/watch/schedule') return reply(response,200,watchSchedule.configure(body,{explicit:true}));
+          if (url.pathname === '/api/watch/schedule') { const saved=await watchSchedule.configure(body,{explicit:true}); if(body.enabled===false){await watchService.stop({explicit:true});videoLimits?.endSession({explicit:true,reason:'允许自动观看已关闭。'});await enforceVideo();} else void watchSchedule.tick(); return reply(response,200,saved); }
           if (url.pathname === '/api/watch/start') {
             if (Object.keys(body).some(key => !['startSession', 'maxRequests'].includes(key))) return reply(response, 400, { error: '自主观看只接受是否开启有限轮次及请求上限。' });
             if (active || forwardAbort) return reply(response, 409, { error: '请先停止手动视频任务或等待转发结束。' });
@@ -279,8 +286,8 @@ export function createApiServer({ controller, config, personaMemory, watchServic
         if (!chatService || !videoLimits) return reply(response, 503, { error: '转发需要已核对的私信许可名单及视频时间模块。' });
         if (request.method === 'GET' && url.pathname === '/api/forward/contacts') {
           const result = await chatService.listContacts({ signal: AbortSignal.timeout(60_000) });
-          const approved = new Set(chatService.state().policy.allowlist.map((item) => item.id));
-          return reply(response, 200, { contacts: (result.contacts || []).filter((item) => approved.has(item.id) && item.followed === true && item.isGroup === false), blocked: result.blocked, loginRequired: result.loginRequired, verificationRequired: result.verificationRequired });
+          const approved = chatService.state().policy.allowlist;
+          return reply(response, 200, { contacts: (result.contacts || []).filter((item) => approved.some(saved => matchesAuthorizedContact(saved, item))), blocked: result.blocked, loginRequired: result.loginRequired, verificationRequired: result.verificationRequired });
         }
         if (request.method === 'POST' && url.pathname === '/api/forward') {
           const body = await readJson(request);
@@ -295,7 +302,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
             } catch { return reply(response, 400, { error: '请使用 https://www.douyin.com/video/数字 形式的作品链接；留空转发当前作品。' }); }
           }
           if (forwardAbort || active || watchService?.state().running) return reply(response, 409, { error: '已有视频任务、自主观看或转发正在执行，请等待完成。' });
-          if (!chatService.state().policy.allowlist.some((item) => item.id === body.recipientId && item.followed === true && item.isGroup === false)) return reply(response, 403, { error: '此联系人不在已核对的许可名单内。' });
+          if (!chatService.state().policy.allowlist.some((item) => item.id === body.recipientId && isStoredContactAuthorized(item))) return reply(response, 403, { error: '此联系人不在已核对的许可名单内。' });
           const permit = videoLimits.beforeAction('api', 'douyin_forward_video');
           if (!permit.allowed) { await enforceVideo(); return reply(response, 409, { error: permit.reason }); }
           const releaseManual = watchService?.claimManual('forward');
@@ -303,7 +310,8 @@ export function createApiServer({ controller, config, personaMemory, watchServic
           const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(60_000)]);
           try {
             const contacts = await chatService.listContacts({ signal });
-            if (contacts.blocked || contacts.loginRequired || contacts.verificationRequired || !contacts.contacts?.some((item) => item.id === body.recipientId && item.followed === true && item.isGroup === false) || !chatService.state().policy.allowlist.some((item) => item.id === body.recipientId)) return reply(response, 403, { error: '当前关注关系或联系人身份未能核对，未转发。' });
+            const stored = chatService.state().policy.allowlist.find(item => item.id === body.recipientId);
+            if (contacts.blocked || contacts.loginRequired || contacts.verificationRequired || !contacts.contacts?.some((item) => matchesAuthorizedContact(stored, item))) return reply(response, 403, { error: '当前授权关系或联系人身份未能核对，未转发。' });
             signal.throwIfAborted();
             const latest = videoLimits.beforeAction('api', 'douyin_forward_video');
             if (!latest.allowed) { await enforceVideo(); return reply(response, 409, { error: latest.reason }); }
@@ -326,7 +334,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
           forwardAbort?.abort(new Error('用户开始新一轮，结束上一次转发操作。'));
           await Promise.allSettled(['api','dsh'].map((source) => pauseSource(source)));
           const state = videoLimits.markSession('api', { explicit: true }); lastVideoDenial = '';
-          append({ type: 'video.started', message: `已开始新一轮，${state.policy.sessionMinutes === null ? '不限单轮时长' : `上限 ${state.policy.sessionMinutes} 分钟`}；API 与 DSH 共用这轮时钟。` });
+          append({ type: 'video.started', message: '已开始观看，插件与软件共用当天观看时长和模型请求额度。' });
           return reply(response, 200, state);
         }
         if (url.pathname === '/api/video/end') { if (Object.keys(body).length) return reply(response, 400, { error: '结束当前轮不接受额外参数。' }); const state = videoLimits.endSession({ explicit: true }); await enforceVideo(); return reply(response, 200, state); }
@@ -339,10 +347,13 @@ export function createApiServer({ controller, config, personaMemory, watchServic
         else if (request.method === 'GET' && url.pathname === '/api/chat/contacts') result = await chatService.listContacts();
         else if (request.method === 'POST') {
           const body = await readJson(request);
-          if (url.pathname === '/api/chat/configure') result = await chatService.configure(body);
-          else if (url.pathname === '/api/chat/start') result = await chatService.start();
-          else if (url.pathname === '/api/chat/stop') result = chatService.stop();
-          else if (url.pathname === '/api/chat/resolve') result = chatService.resumeContact(body.recipientId);
+          if (url.pathname === '/api/chat/configure') result = await friendInteractions.configureContacts(body);
+          else if (url.pathname === '/api/chat/start') { await friendInteractions.configure({enabled:true},{explicit:true}); result=chatService.state(); }
+          else if (url.pathname === '/api/chat/stop') { await friendInteractions.configure({enabled:false},{explicit:true}); result=chatService.state(); }
+          else if (url.pathname === '/api/chat/resolve') {
+            if (Object.keys(body).length !== 1 || typeof body.recipientId !== 'string') return reply(response, 400, { error: '只接受已核对的许可联系人。' });
+            result = await friendInteractions.resumeContact(body.recipientId);
+          }
           else return reply(response, 404, { error: '私信接口不存在。' });
         } else return reply(response, 404, { error: '私信接口不存在。' });
         return reply(response, 200, redact(result, [config.apiKey]));
@@ -392,19 +403,21 @@ export function createApiServer({ controller, config, personaMemory, watchServic
   server.configureApi = value => {
     if (stopping) throw new Error('本机服务正在退出，不能修改 API 设置。');
     const spark = sparkService?.state();
-    if (active || forwardAbort || shareService?.active || commentService?.active || watchService?.state().running || chatService?.running || chatService?.starting || chatService?.busy || chatService?.worker?.()?.alive || spark?.running || spark?.starting || spark?.busy || spark?.worker?.alive) throw new Error('请先停止视频任务、自主观看、评论、转发、私信回复和续火花服务，再修改 API 设置。');
+    if (active || forwardAbort || shareService?.active || commentService?.active || watchService?.state().running || chatService?.starting || chatService?.busy || spark?.running || spark?.starting || spark?.busy || spark?.worker?.alive) throw new Error('请先停止视频任务、自主观看、评论、转发或等待正在处理的私信完成，再修改 API 设置。');
     const updated = normalizeApiConfig(value);
     Object.assign(config, updated);
     agent.config = config;
     if (chatService) { chatService.config = config; if (chatService.agent) chatService.agent.config = config; }
     if (watchService) { watchService.config = config; if (watchService.agent) watchService.agent.config = config; if (watchService.commentAgent) watchService.commentAgent.config = config; }
     if (sparkService) { sparkService.config = config; if (sparkService.agent) sparkService.agent.config = config; }
+    void friendInteractions.reconcile();
     return publicApiConfig(config);
   };
   server.stopTask = () => { const error = new Error('控制台已关闭。'); active?.abort.abort(error); forwardAbort?.abort(error); browserAbort?.abort(error); watchService?.cancel(); };
   server.enforceVideoLimits = enforceVideo;
   const cleanup = () => cleanupPromise ??= (async () => {
     stopping = true;
+    await friendInteractions.close();
     cancelVideoWatch?.();
     await watchSchedule.close();
     const pending = active?.completion;
@@ -432,6 +445,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
     shutdownHooks.push(hook);
   };
   server.watchSchedule = watchSchedule;
+  server.friendInteractions = friendInteractions;
   server.stop = () => stopPromise ??= (async () => {
     stopping = true;
     cancelVideoWatch?.();
@@ -497,6 +511,7 @@ export async function startApiServer({ port = Number(process.env.DOUYIN_API_PORT
     throw error;
   }
   server.watchSchedule.start();
+  void server.friendInteractions.start();
   console.log(`大肥鱼 · 视频助手：http://127.0.0.1:${server.address().port}`);
   console.log(`模型：${config.model}；凭据：${config.apiKey ? '已在内存读取' : '未配置'}`);
   const signalHandlers = ['SIGINT', 'SIGTERM'].map(signal => {

@@ -61,19 +61,20 @@ test('视频任务和私信进程忙碌时拒绝换密钥，停止后才接受�
     await new Promise(resolve => setTimeout(resolve, 5));
   }
   assert.equal(state.running, false); assert.equal(JSON.stringify(state).includes(f.config.apiKey), false);
-  for (const field of ['running', 'starting', 'busy']) { f.chatService[field] = true; assert.throws(() => f.server.configureApi({}), /先停止/); f.chatService[field] = false; }
-  f.chatService.worker = () => ({ alive: true }); assert.throws(() => f.server.configureApi({}), /先停止/);
+  f.chatService.running=true;assert.equal(f.server.configureApi({apiKey:'synthetic-idle-key'}).configured,true);f.chatService.running=false;
+  for (const field of ['starting', 'busy']) { f.chatService[field] = true; assert.throws(() => f.server.configureApi({}), /先停止/); f.chatService[field] = false; }
+  f.chatService.worker = () => ({ alive: true }); assert.equal(f.server.configureApi({apiKey:'synthetic-idle-key'}).configured,true);
   f.chatService.worker = () => null; assert.equal(f.server.configureApi({ apiKey: 'synthetic-next' }).configured, true);
 });
 
 test('转发正在核对联系人时也不能切换 API 设置，合成确认结束后解除占用', async t => {
   const entered = Promise.withResolvers(), release = Promise.withResolvers();
-  const contact = { id: 'synthetic-friend', followed: true, isGroup: false };
+  const contact = { id: 'synthetic-friend', name: '合成好友', followed: true, isGroup: false, verifiedAt: '2026-10-24T00:00:00.000Z' };
   const chatService = { state: () => ({ policy: { allowlist: [contact] } }), listContacts: async () => { entered.resolve(); await release.promise; return { contacts: [contact] }; }, close: async () => {} };
   const videoLimits = { watch: () => () => {}, beforeAction: () => ({ allowed: true }), enforce: async () => {} };
   const f = await fixture(t, { chatService, videoLimits });
   const pending = fetch(`${f.base}/api/forward`, { method: 'POST', headers: f.headers, body: JSON.stringify({ recipientId: contact.id }) });
-  await entered.promise;
+  await Promise.race([entered.promise, pending.then(response => { throw new Error(`核对器尚未进入，请求已返回 ${response.status}`); }), new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('等待合成核对器超时。')), 5000); timer.unref(); })]);
   try { assert.throws(() => f.server.configureApi({ apiKey: 'synthetic-next' }), /先停止/); }
   finally { release.resolve(); }
   const response = await pending; assert.equal(response.status, 200); await response.json();

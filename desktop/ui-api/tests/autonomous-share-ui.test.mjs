@@ -8,11 +8,12 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from '../../../playwright-runtime.mjs';
 import { TASK_LIMIT_BOUNDS } from '../../../task-limits.mjs';
 
-test('生产自主分享入口只保存总许可，观看中可关闭，异常核对与任务预算按实际合同接线', { timeout: 60_000 }, async t => {
+test('好友总开关在观看中可关闭，分享异常收据独立核对且观看证据仍可查看', { timeout: 60_000 }, async t => {
   const dist = fileURLToPath(new URL('../dist/', import.meta.url)), shots = fileURLToPath(new URL('../.test-temp/', import.meta.url)); await fs.mkdir(shots, { recursive: true });
   const calls = [], errors = []; let failedReview = false;
-  const recipients = [{ id: 'synthetic-friend-a', name: '合成许可好友甲' }, { id: 'synthetic-friend-b', name: '合成许可好友乙' }];
-  const share = { protocol: 'autonomous-share-v1', enabled: false, dailyLimit: 3, recipients, daily: { attempts: 0, remaining: 3 }, paused: false, busy: false, recent: [], needsReview: [], receiptsFile: 'C:\\合成分享收据.json' };
+  const recipients = ['a', 'b'].map((hex, index) => ({ id: 'conv:' + hex.repeat(64), name: index === 0 ? '合成许可好友甲' : '合成许可好友乙', followed: true, isGroup: false, identityVerified: true, identityVersion: 2, identityKind: 'rendered-user', identityHash: hex.repeat(64), identityBinding: 'binding:' + hex.repeat(64), verifiedAt: '2026-10-24T00:00:00.000Z', authorizationKind: 'following' }));
+  const share = { protocol: 'autonomous-share-v1', enabled: false, dailyLimit: 3, recipients, daily: { attempts: 0, remaining: 3 }, paused: false, busy: false, recent: [{operationId:'synthetic-failed-new',recipientId:recipients[0].id,videoId:'11111',status:'not-sent',failure:{code:'SHARE_PANEL_UNAVAILABLE',stage:'open-panel',message:'合成分享面板未显示。'}},{operationId:'synthetic-failed-old',recipientId:recipients[0].id,videoId:'22222',status:'not-sent'}], needsReview: [], receiptsFile: 'C:\\合成分享收据.json' };
+  const interactions = { policy: { enabled: true }, friend: { replyRunning: true, shareEnabled: true }, rows: [] };
   const watch = { running: false, status: 'stopped', owned: false, worker: null, lastError: '合成停止原因：本轮请求预算已用完。', counts: { requests: 2, maxRequests: 30, dailyRequests: 2, dailyLimit: 200 }, lastDecision: { action: 'share', reason: '合成选择理由：准备向许可好友分享当前观察作品。' } };
   const limits = { protocol: 'task-limits-v1', policy: { maxSteps: 20, maxToolCalls: 20, timeoutSeconds: 180 }, hardLimits: TASK_LIMIT_BOUNDS, configured: false };
   const persona = { revision: 'synthetic-behavior', manualText: '合成手编人格', personaText: '合成生效人格', interests: [
@@ -32,6 +33,8 @@ test('生产自主分享入口只保存总许可，观看中可关闭，异常�
         if (url.pathname === '/api/video/status') return reply({ allowed: true, window: {}, remainingSeconds: 120, session: { status: 'active' }, policy: { windows: ['00:00-24:00'], sessionMinutes: 10 } });
         if (url.pathname === '/api/task/limits') { if (request.method === 'POST') { limits.policy = JSON.parse(raw); limits.configured = true; } return reply(limits); }
         if (url.pathname === '/api/watch/state') return reply(watch);
+        if (url.pathname === '/api/interactions/state') return reply(interactions);
+        if (url.pathname === '/api/interactions/configure') { interactions.policy.enabled = JSON.parse(raw).enabled; interactions.friend.replyRunning = interactions.policy.enabled; share.enabled = interactions.policy.enabled; return reply(interactions); }
         if (url.pathname === '/api/share/state') return reply(share);
         if (url.pathname === '/api/share/configure') { const body = JSON.parse(raw); share.enabled = body.enabled; share.dailyLimit = body.dailyLimit; share.daily.remaining = Math.max(0, body.dailyLimit - share.daily.attempts); return reply(share); }
         if (url.pathname === '/api/share/resolve') {
@@ -58,57 +61,31 @@ test('生产自主分享入口只保存总许可，观看中可关闭，异常�
   await page.addInitScript(() => { window.douyinDesktop = { getSettings: () => window.__getSyntheticSettings(), saveSettings: async () => ({}), clearApiKey: async () => ({}), openMemoryFolder: async () => {}, openPersonaFolder: async () => {} }; });
   await page.goto(`http://127.0.0.1:${server.address().port}`);
 
-  await page.getByRole('button', { name: /◌ 对话与视频/ }).click();
-  await page.getByRole('button', { name: '展开快捷控制', exact: true }).click();
-  const panel = page.locator('[aria-labelledby="auto-share-title"]'), toggle = panel.getByRole('switch', { name: '允许大肥鱼自主分享' }), limit = panel.getByRole('spinbutton', { name: '自主分享每日次数上限' }), save = panel.getByRole('button', { name: '保存自主分享设置', exact: true });
-  await page.waitForFunction(() => document.querySelector('[aria-label="自主分享每日次数上限"]')?.disabled === false);
-  await page.getByRole('status').filter({ hasText: '上次自主观看停止原因：合成停止原因：本轮请求预算已用完。' }).waitFor();
-  await panel.getByText('名单在“业务设置 → 好友互动 → 好友私信”中维护。读取联系人、勾选并保存许可名单即可，不需要启用自动回复；不会自动加入其他联系人。', { exact: true }).waitFor();
-  assert.equal(await limit.inputValue(), '3'); assert.equal(await toggle.getAttribute('aria-checked'), 'false');
-  assert.equal(await page.getByLabel('转发收件人', { exact: true }).count(), 0); assert.equal(await page.getByLabel('转发作品链接', { exact: true }).count(), 0);
-  assert.equal(await page.getByRole('button', { name: '选择此作品转发', exact: true }).count(), 0);
-  const steps = page.getByRole('spinbutton', { name: '手动任务步数上限' }), toolCalls = page.getByRole('spinbutton', { name: '手动任务工具调用上限' }), seconds = page.getByRole('spinbutton', { name: '手动任务超时秒数' });
-  await steps.fill('40'); await toolCalls.fill('45'); await seconds.fill('600'); await toggle.click(); await limit.fill('5'); await page.waitForTimeout(1700);
-  assert.equal(await limit.inputValue(), '5'); assert.equal(await toggle.getAttribute('aria-checked'), 'true'); assert.equal(await steps.inputValue(), '40');
+  await page.getByRole('tab', { name: '好友互动', exact: true }).click();
+  const panel = page.locator('.panel').filter({ has: page.getByRole('heading', { name: '好友互动', exact: true }) }), receipts = panel.getByLabel('分享收据', { exact: true }), toggle = panel.getByRole('switch', { name: '允许好友互动', exact: true });
+  assert.equal(await panel.getByRole('switch').count(), 1); assert.equal(await panel.getByRole('spinbutton').count(), 0);
+  assert.equal(await page.getByRole('button', { name: /保存自主分享|启用自动回复|自动问候/ }).count(), 0);
   Object.assign(watch, { running: true, status: 'running', worker: { source: 'dsh', alive: true }, owned: false });
-  await page.getByRole('button', { name: '停止当前自主观看', exact: true }).waitFor();
-  assert.equal(await steps.isDisabled(), true); assert.equal(await save.isDisabled(), false); assert.equal(await toggle.isDisabled(), false);
-  await save.click(); await panel.getByText('已允许大肥鱼在许可好友中自主选择分享；这次保存不会立即发送。', { exact: true }).waitFor();
-  await toggle.click(); await save.click(); await panel.getByText('已关闭自主分享，停止后续发送。', { exact: true }).waitFor();
-  assert.deepEqual(calls.filter(call => call.route === '/api/share/configure').map(call => JSON.parse(call.body)), [{ enabled: true, dailyLimit: 5 }, { enabled: false, dailyLimit: 5 }]);
-  await limit.fill('21'); await save.click(); assert.equal(await limit.evaluate(input => input.validity.rangeOverflow), true); assert.equal(calls.filter(call => call.route === '/api/share/configure').length, 2);
-  await limit.fill('4'); share.dailyLimit = 9; await page.waitForTimeout(1700); assert.equal(await limit.inputValue(), '4');
+  await page.getByText(/自主观看进行中/).waitFor(); assert.equal(await toggle.isEnabled(), true);
+  await toggle.click(); await page.waitForFunction(() => document.querySelector('[aria-label="允许好友互动"]').getAttribute('aria-checked') === 'false');
+  assert.equal(share.enabled, false); assert.equal(watch.running, true);
   share.paused = true; share.needsReview = [{ operationId: 'synthetic-review-a', recipientId: recipients[0].id, videoId: '1111111111111', status: 'uncertain' }, { operationId: 'synthetic-review-b', recipientId: recipients[1].id, videoId: '2222222222222', status: 'uncertain' }];
-  await panel.getByRole('button', { name: '已人工核对送达', exact: true }).first().waitFor();
-  const firstReview = panel.locator('.paused-contact').filter({ hasText: '合成许可好友甲' });
-  await firstReview.getByRole('button', { name: '已人工核对送达', exact: true }).click();
-  await page.getByText('合成核对暂时冲突，请稍后重试。', { exact: true }).waitFor();
+  await receipts.getByRole('button', { name: '已人工核对送达', exact: true }).first().waitFor();
+  const firstReview = receipts.locator('.paused-contact').filter({ hasText: '合成许可好友甲' });
+  await firstReview.getByRole('button', { name: '已人工核对送达', exact: true }).click(); await page.getByRole('alert').filter({ hasText: '核对分享结果：合成核对暂时冲突，请稍后重试。' }).waitFor();
   assert.equal(calls.filter(call => call.route === '/api/share/resolve').length, 1);
-  await firstReview.getByRole('button', { name: '已人工核对送达', exact: true }).click();
-  await firstReview.getByText('核对结果已提交，等待状态回读；不会重复提交。', { exact: true }).waitFor();
-  await page.waitForTimeout(1700);
-  assert.equal(await firstReview.getByRole('button', { name: '已人工核对送达', exact: true }).count(), 0);
+  await firstReview.getByRole('button', { name: '已人工核对送达', exact: true }).click(); await firstReview.getByText('核对结果已提交，等待状态回读；不会重复提交。', { exact: true }).waitFor();
+  await page.waitForTimeout(1700); assert.equal(await firstReview.getByRole('button', { name: '已人工核对送达', exact: true }).count(), 0);
   assert.equal(calls.filter(call => call.route === '/api/share/resolve').length, 2);
   share.needsReview = share.needsReview.filter(item => item.operationId !== 'synthetic-review-a');
-  await panel.locator('.paused-contact').filter({ hasText: '合成许可好友乙' }).getByRole('button', { name: '已人工核对未送达', exact: true }).click();
-  await page.waitForFunction(() => document.querySelectorAll('[aria-labelledby="auto-share-title"] .paused-contact').length === 0);
+  await receipts.locator('.paused-contact').filter({ hasText: '合成许可好友乙' }).getByRole('button', { name: '已人工核对未送达', exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll('[aria-label="分享收据"] .paused-contact').length === 0);
   assert.deepEqual(calls.filter(call => call.route === '/api/share/resolve').map(call => JSON.parse(call.body)), [{ operationId: 'synthetic-review-a', outcome: 'confirmed' }, { operationId: 'synthetic-review-a', outcome: 'confirmed' }, { operationId: 'synthetic-review-b', outcome: 'not-sent' }]);
-  await save.click(); await panel.getByText('已关闭自主分享，停止后续发送。', { exact: true }).waitFor();
-  assert.deepEqual(JSON.parse(calls.filter(call => call.route === '/api/share/configure').at(-1).body), { enabled: false, dailyLimit: 4 });
-  await panel.locator('summary').filter({ hasText: '最近分享记录' }).click(); await page.screenshot({ path: path.join(shots, 'synthetic-autonomous-share.png'), fullPage: true });
-  await panel.screenshot({ path: path.join(shots, 'synthetic-autonomous-share-panel.png') });
-  await page.getByRole('button', { name: /◉ 自主观看/ }).click(); await page.getByText('分享当前作品', { exact: true }).waitFor();
+  await receipts.getByText('最近分享记录', { exact: true }).click();
+  await receipts.getByText('原因：合成分享面板未显示。', { exact: true }).waitFor();
+  await receipts.getByText('原因：旧记录没有保存详细失败原因。', { exact: true }).waitFor();
+  await page.getByRole('button', { name: /◉ 自主观看/ }).click();
   const neutral = page.locator('.interest-card').filter({ hasText: '合成像素识别主题' }); assert.equal(await neutral.getByText('待观察', { exact: true }).isVisible(), true); assert.equal(await neutral.getByText('感兴趣', { exact: true }).count(), 0);
-  const observed = page.locator('.observation-entry').filter({ hasText: '合成行为观察作品' });
-  await observed.getByText('已核实观看 10 秒', { exact: true }).waitFor(); await observed.getByText('观看比例 50%', { exact: true }).waitFor(); await observed.getByText('继续停留 1 次', { exact: true }).waitFor();
-  assert.match(await page.locator('.interest-card').filter({ hasText: '合成观看行为主题' }).innerText(), /正向 1.*负向 0.*待观察 0/);
-  await page.locator('.watch-view').screenshot({ path: path.join(shots, 'synthetic-behavior-evidence.png') });
-  Object.assign(watch, { running: false, status: 'stopped', worker: null });
-  await page.waitForFunction(() => document.querySelector('[aria-label="手动任务步数上限"]').disabled === false);
-  await page.getByRole('button', { name: '保存手动任务预算', exact: true }).click(); await page.getByText('手动任务预算已保存，将用于之后启动的任务。', { exact: true }).waitFor();
-  assert.deepEqual(JSON.parse(calls.find(call => call.route === '/api/task/limits' && call.method === 'POST').body), { maxSteps: 40, maxToolCalls: 45, timeoutSeconds: 600 });
-  await page.getByRole('button', { name: /对话与视频/ }).click(); await page.getByText('最多 40 步 · 45 次工具 · 600 秒', { exact: true }).waitFor();
-  const writes = calls.filter(call => call.method === 'POST');
-  assert.equal(writes.every(call => ['/api/share/configure', '/api/share/resolve', '/api/task/limits'].includes(call.route)), true);
-  assert.equal(writes.every(call => call.token === 'synthetic-share-session'), true); assert.deepEqual(errors, []);
+  const observed = page.locator('.observation-entry').filter({ hasText: '合成行为观察作品' }); await observed.getByText('已核实观看 10 秒', { exact: true }).waitFor(); await observed.getByText('观看比例 50%', { exact: true }).waitFor(); await observed.getByText('继续停留 1 次', { exact: true }).waitFor();
+  const writes = calls.filter(call => call.method === 'POST'); assert.equal(writes.every(call => ['/api/interactions/configure', '/api/share/resolve'].includes(call.route)), true); assert.equal(writes.every(call => call.token === 'synthetic-share-session'), true); assert.deepEqual(errors, []);
 });

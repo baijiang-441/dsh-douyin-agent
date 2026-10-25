@@ -12,7 +12,7 @@ import { chromium } from '../../playwright-runtime.mjs';
 const desktop = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), domain = path.dirname(desktop);
 const { version } = JSON.parse(await fs.readFile(path.join(desktop, 'package.json'), 'utf8'));
 const releaseDirectory = process.argv[2] ? path.resolve(process.argv[2]) : path.join(desktop, 'release-api');
-const executable = path.join(releaseDirectory, `Dafeiyu-Douyin-API-${version}-win-x64.exe`);
+const executable = process.argv[3] === '--unpacked' ? path.join(releaseDirectory,'win-unpacked','大肥鱼抖音助手.exe') : path.join(releaseDirectory, `Dafeiyu-Douyin-API-${version}-win-x64.exe`);
 const unpacked = path.join(releaseDirectory, 'win-unpacked'), resources = path.join(unpacked, 'resources');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const rootRequire = createRequire(path.join(desktop, 'package.json'));
@@ -77,9 +77,15 @@ try {
   browser = await chromium.connectOverCDP(`http://127.0.0.1:${Number(debug[0])}`);
   page = browser.contexts()[0].pages().find(item => item.url().startsWith(ready.origin)); assert.ok(page);
   const errors = []; page.on('pageerror', error => errors.push(error.message));
+  const forbiddenActions = [], forbidden = new Set(['/api/browser/open', '/api/task', '/api/watch/start', '/api/chat/start', '/api/forward', '/api/spark/start']);
+  await page.route('**/api/**', route => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (route.request().method() === 'POST' && forbidden.has(pathname)) { forbiddenActions.push(pathname); return route.fulfill({ status: 403, json: { error: '打包验收不允许启动浏览器、模型任务或真实发送。' } }); }
+    return route.continue();
+  });
   await page.getByRole('heading', { name: '先连接你的 DeepSeek' }).waitFor();
   await page.getByRole('textbox', { name: 'API Key', exact: true }).fill('synthetic-packaged-check-only');
-  await page.getByRole('button', { name: '保存并连接', exact: true }).click();
+  await page.getByRole('textbox', { name: 'API Key', exact: true }).press('Tab');
   await page.getByRole('dialog').waitFor({ state: 'hidden' });
   await page.getByText(`独立 API 版 · ${version}`, { exact: true }).waitFor();
   assert.deepEqual(await page.getByRole('navigation',{name:'主导航'}).getByRole('button').allTextContents(),['◌ 对话与视频','☷ 业务设置','◉ 自主观看记录']);
@@ -98,27 +104,87 @@ try {
   const diagnostics = JSON.parse(await page.getByRole('textbox', { name: '诊断报告', exact: true }).inputValue());
   assert.equal(diagnostics.protocol, 'diagnostics-v2'); assert.equal(diagnostics.pluginVersion, version);
   assert.ok(diagnostics.checks.some(item => item.id === 'silent_window'));
+  await page.getByRole('button', { name:'查看好友互动状态', exact:true }).waitFor();
+  const readStatus = route => page.evaluate(async route => {
+    const boot = await (await fetch('/api/bootstrap')).json();
+    const response = await fetch(route, { headers: { 'x-session-token': boot.token } });
+    if (!response.ok) throw new Error(`本机回读失败：${route}`);
+    return response.json();
+  }, route);
+  assert.equal((await readStatus('/api/chat/state')).policy.allowlist.length, 0, '隔离验收不得带入真实许可名单');
+  assert.equal((await readStatus('/api/watch/schedule')).policy.enabled, false, '隔离验收不启用实际自动观看');
+  assert.equal((await readStatus('/api/interactions/state')).presence.online, false, '空名单不冒充在线');
   await page.getByRole('tab', { name: '视频观看', exact: true }).click();
-  await page.getByRole('spinbutton',{name:'自动观看模型请求上限',exact:true}).fill('66');
-  await page.getByRole('button',{name:'保存自动启动设置',exact:true}).click();
+  await until(async()=>page.getByRole('button',{name:'开始自主观看',exact:true}).isEnabled());
+  assert.equal(await page.getByRole('button',{name:'暂停观看',exact:true}).isDisabled(),true);
+  assert.equal(await page.getByRole('switch', { name: '允许自动观看', exact: true }).getAttribute('aria-checked'), 'false');
+  assert.equal(await page.getByRole('button', { name: /^保存/ }).count(), 0, '设置修改自动保存，不显示旧保存按钮');
   await page.getByRole('combobox', { name: '观看方式', exact: true }).selectOption('topic');
   await page.getByRole('textbox', { name: '想看的主题', exact: true }).fill('合成打包主题');
-  await page.getByRole('button', { name: '保存观看主题', exact: true }).click();
-  await page.getByText('主题已保存，插件与软件共用；下次自主观看生效。', { exact: true }).waitFor();
+  await until(async () => (await readStatus('/api/watch/options')).policy.topics.includes('合成打包主题'));
   await page.getByRole('button', { name: '谷时段（DeepSeek）', exact: true }).click();
-  await page.getByRole('switch', { name: '不限单轮时长', exact: true }).click();
-  const saveTime = () => Promise.all([page.waitForResponse(response => response.url().endsWith('/api/video/policy') && response.request().method() === 'POST'), page.getByRole('button', { name: '保存时间设置', exact: true }).click()]);
-  const savedMinutes = () => page.evaluate(async () => { const boot = await (await fetch('/api/bootstrap')).json(); return (await (await fetch('/api/video/status', { headers: { 'x-session-token': boot.token } })).json()).policy.sessionMinutes; });
-  await saveTime();
-  const minutes = page.getByRole('spinbutton', { name: '单轮上限', exact: true });
-  assert.equal(await minutes.isEnabled(), true); assert.equal(await minutes.inputValue(), ''); assert.equal(await savedMinutes(), null);
-  await minutes.fill('25'); await delay(1700);
-  assert.equal(await minutes.inputValue(), '25'); assert.equal(await page.getByRole('switch', { name: '不限单轮时长', exact: true }).getAttribute('aria-checked'), 'false');
-  assert.equal(await savedMinutes(), null);
-  await saveTime(); assert.equal(await savedMinutes(), 25);
-  await page.getByRole('switch', { name: '不限单轮时长', exact: true }).click(); await saveTime();
+  await until(async () => (await readStatus('/api/video/status')).policy.windows.join() === '00:00-09:00,12:00-14:00,18:00-24:00');
+  await page.getByText('高级选项', { exact: true }).click();
+  await page.getByRole('switch', { name: '不限每日观看时长', exact: true }).click();
+  await until(async () => (await readStatus('/api/video/status')).policy.dailyMinutes === null);
+  const minutes = page.getByRole('spinbutton', { name: '每日观看上限', exact: true });
+  assert.equal(await minutes.isEnabled(), true); assert.equal(await minutes.inputValue(), '');
+  await minutes.fill('25');
+  await until(async () => (await readStatus('/api/video/status')).policy.dailyMinutes === 25);
+  assert.equal(await minutes.inputValue(), '25'); assert.equal(await page.getByRole('switch', { name: '不限每日观看时长', exact: true }).getAttribute('aria-checked'), 'false');
+  await page.getByRole('switch', { name: '不限每日观看时长', exact: true }).click();
+  await until(async () => (await readStatus('/api/video/status')).policy.dailyMinutes === null);
+  await page.getByRole('switch', { name: '不限每日模型请求次数', exact: true }).click();
+  await until(async () => (await readStatus('/api/video/status')).policy.dailyRequests === null);
+  await page.getByRole('spinbutton', { name: '每日观看模型请求上限', exact: true }).fill('66');
+  await until(async () => (await readStatus('/api/video/status')).policy.dailyRequests === 66);
   await page.getByRole('tab', { name: '好友互动', exact: true }).click();
-  await page.locator('[aria-labelledby="auto-share-title"]').getByText('名单在“业务设置 → 好友互动 → 好友私信”中维护。读取联系人、勾选并保存许可名单即可，不需要启用自动回复；不会自动加入其他联系人。', { exact: true }).waitFor();
+  await page.getByRole('switch', { name: '允许好友互动', exact: true }).waitFor();
+  await until(async () => (await readStatus('/api/interactions/state')).policy.enabled === true);
+  assert.equal(await page.getByRole('switch', { name: '允许好友互动', exact: true }).getAttribute('aria-checked'), 'true');
+  assert.equal(await page.getByRole('heading', { name: /续火花|自动问候/ }).count(), 0);
+  assert.equal(await page.getByRole('switch', { name: /续火花|自动问候|允许自主分享/ }).count(), 0, '好友互动只保留统一总开关');
+  for (const enabled of [false, true, false]) {
+    await page.getByRole('switch', { name: '允许好友互动', exact: true }).click();
+    await until(async () => (await readStatus('/api/interactions/state')).policy.enabled === enabled);
+    await until(async () => await page.getByRole('switch', { name: '允许好友互动', exact: true }).getAttribute('aria-checked') === String(enabled));
+    if (!enabled) await until(async()=> (await page.getByRole('button',{name:'查看好友互动状态',exact:true}).innerText()).includes('离线'));
+  }
+  assert.equal((await readStatus('/api/chat/state')).running, false, '空名单切换总开关不会启动回复');
+  await page.getByRole('textbox', { name: '群聊响应昵称', exact: true }).waitFor();
+  assert.equal(await page.getByRole('textbox', { name: '群聊响应昵称', exact: true }).inputValue(), '大肥鱼');
+  const syntheticContacts = [
+    { id: 'conv:' + 'a'.repeat(64), name: '合成许可个人', followed: true, isGroup: false, identityVersion: 2, identityKind: 'rendered-user', identityHash: 'a'.repeat(64), identityVerified: true, identityBinding: 'binding:' + 'a'.repeat(64), verifiedAt: new Date().toISOString(), authorizationKind: 'following' },
+    { id: 'conv:' + 'b'.repeat(64), name: '合成许可群聊', followed: null, isGroup: true, identityVersion: 2, identityKind: 'rendered-group', identityHash: 'b'.repeat(64), verifiedAt: new Date().toISOString(), authorizationKind: 'existing-group', identityVerified: true, identityBinding: 'binding:' + 'b'.repeat(64), relationshipStatus: 'unavailable' },
+    { id: 'conv:' + 'c'.repeat(64), name: '合成未知类型', followed: null, isGroup: null, identityVerified: false, relationshipStatus: 'unavailable' },
+  ];
+  let groupSave;
+  const syntheticChat = { running: false, policy: { allowlist: [], dailyReplyLimit: null, groupMentionNames: ['大肥鱼'] }, contacts: [], daily: { requests: 0, limit: null } };
+  const syntheticChatRoute = async route => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (pathname === '/api/chat/contacts') return route.fulfill({ json: { contacts: syntheticContacts } });
+    if (pathname === '/api/chat/state') return route.fulfill({ json: syntheticChat });
+    if (pathname === '/api/chat/configure') { groupSave = route.request().postDataJSON(); syntheticChat.policy = { ...syntheticChat.policy, ...groupSave, allowlist: syntheticContacts.filter(item => groupSave.recipientIds.includes(item.id)) }; return route.fulfill({ json: syntheticChat }); }
+    forbiddenActions.push(pathname); return route.fulfill({ status: 403, json: { error: '合成设置验收不允许启动或发送。' } });
+  };
+  await page.route('**/api/chat/**', syntheticChatRoute);
+  await page.getByRole('button', { name: '读取联系人与群聊', exact: true }).click();
+  const groupChoice = page.getByRole('checkbox', { name: '许可联系人 合成许可群聊', exact: true });
+  await groupChoice.waitFor(); assert.equal(await groupChoice.isDisabled(), true);
+  await page.getByRole('checkbox', { name: '授权已核对的现有会话', exact: true }).check();
+  assert.equal(await groupChoice.isEnabled(), true);
+  assert.equal(await page.getByRole('checkbox', { name: '许可联系人 合成未知类型', exact: true }).isDisabled(), true);
+  await groupChoice.check();
+  await page.getByRole('textbox', { name: '群聊响应昵称', exact: true }).fill('大肥鱼,肥鱼');
+  await page.getByRole('textbox', { name: '群聊响应昵称', exact: true }).press('Tab');
+  await until(() => groupSave?.recipientIds?.join() === 'conv:' + 'b'.repeat(64) && groupSave?.groupMentionNames?.join() === '大肥鱼,肥鱼');
+  assert.equal(groupSave.allowConversationOnly, true); assert.deepEqual(groupSave.groupMentionNames, ['大肥鱼', '肥鱼']); assert.deepEqual(groupSave.recipientIds, ['conv:' + 'b'.repeat(64)]);
+  assert.equal('dailyReplyLimit' in groupSave, false, '人数和回复次数不再由表单添加限额');
+  assert.equal(await page.getByRole('button', { name: /^保存/ }).count(), 0);
+  let groupPreviewCaptured = false;
+  try { await page.screenshot({ path: path.join(releaseDirectory, 'synthetic-group-ui.png'), timeout: 3000, animations: 'disabled' }); groupPreviewCaptured = true; }
+  catch { /* 隐藏的Electron窗口可能没有可截取的合成帧，表单断言仍单独验收。 */ }
+  await page.unroute('**/api/chat/**', syntheticChatRoute);
   const checks = await page.evaluate(async () => {
     const boot = await (await fetch('/api/bootstrap')).json();
     const routes = ['/api/state', '/api/video/status', '/api/watch/state', '/api/chat/state', '/api/share/state', '/api/spark/state', '/api/comments/state', '/api/mode/state', '/api/persona', '/api/media/state', '/api/reports/state', '/api/usage', '/api/watch/options', '/api/watch/schedule', '/api/interactions/state'];
@@ -134,15 +200,19 @@ try {
   });
   assert.equal(checks.cleared, true); assert.equal(checks.status['/api/comments/state'].enabled, false); assert.equal(checks.status['/api/mode/state'].silent, false); assert.equal(checks.status['/api/chat/state'].running, false); assert.equal(checks.status['/api/spark/state'].running, false); assert.equal(checks.status['/api/media/state'].enabled, false); assert.equal(checks.status['/api/watch/state'].running, false);
   assert.deepEqual(errors, []);
-  assert.equal(checks.status['/api/video/status'].policy.sessionMinutes, null);
+  assert.equal(checks.status['/api/video/status'].policy.dailyMinutes, null);
+  assert.equal(checks.status['/api/video/status'].policy.dailyRequests, 66);
   assert.deepEqual(checks.status['/api/video/status'].policy.weekendWindows, ['00:00-24:00']);
   assert.deepEqual(checks.status['/api/watch/options'].policy.topics, ['合成打包主题']);
   assert.equal(checks.status['/api/usage'].today.requests, 0);
-  assert.deepEqual(checks.status['/api/watch/schedule'].policy,{enabled:false,maxRequests:66});
-  assert.equal(checks.status['/api/interactions/state'].rows.length,4);
+  assert.deepEqual(checks.status['/api/watch/schedule'].policy,{enabled:false});
+  assert.deepEqual(checks.status['/api/interactions/state'].rows.map(item => item.id), ['chat','share','comments']);
+  assert.equal(checks.status['/api/interactions/state'].policy.enabled, false);
+  assert.equal(checks.status['/api/chat/state'].policy.allowlist.length, 0);
+  assert.deepEqual(forbiddenActions, [], '验收不得发起真实观看、模型或发送动作');
   const saved = await readJson(path.join(userData, 'api-settings.json'));
   assert.equal('encryptedApiKey' in saved, false); assert.equal(JSON.stringify(saved).includes('synthetic-packaged-check-only'), false);
-  const receipt = { version, executable: path.basename(executable), bytes: bytes.length, sha256, archiveSourcesMatch: true, iconsMatch:true, domainFilesMatch: DOMAIN_FILES.length, runtimeId: manifest.runtimeId, startup: { ready: true, packaged: true, visible: false, isolated: true, version: ready.version }, renderer: { loaded: true, privateKeyIpc: true, syntheticKeyCleared: true, dailyReportRendered: true, navDeduplicated:true, brandLoaded:true, updateIpc:true, scheduleSettingsSaved:true, durationDraftSavedExplicitly:true, shareAllowlistHint:true, pageErrors: errors.length }, readOnlyEndpoints: Object.keys(checks.status).length, automationStarted: false, realModelCalled: false, smokeDirectory: directory };
+  const receipt = { version, executable: path.basename(executable), bytes: bytes.length, sha256, archiveSourcesMatch: true, iconsMatch:true, domainFilesMatch: DOMAIN_FILES.length, runtimeId: manifest.runtimeId, startup: { ready: true, packaged: true, visible: false, isolated: true, version: ready.version }, renderer: { loaded: true, privateKeyIpc: true, apiKeyBlurAutoSaved:true, syntheticKeyCleared: true, dailyReportRendered: true, navDeduplicated:true, brandLoaded:true, updateIpc:true, dailyAdvancedAutoSaved:true, unlimitedDailyDurationEditable:true, topicAutoSaved:true, friendMasterDefaultEnabled:true, friendMasterToggledWithoutRecipients:true, noSparkEntry:true, noSaveButtons:true, syntheticGroupSelectionAutoSaved:true, groupPreviewCaptured, pageErrors: errors.length }, readOnlyEndpoints: Object.keys(checks.status).length, automatedWorkersStarted: false, realModelCalled: false, realMessageSent:false, smokeDirectory: directory };
   await page.evaluate(() => window.close());
   assert.equal(await Promise.race([exited, delay(12_000, null, { ref: false }).then(() => { throw new Error('便携包未正常退出。'); })]), 0);
   await until(async () => { try { await fetch(ready.origin, { signal: AbortSignal.timeout(1000) }); return false; } catch { return true; } }, 12_000);

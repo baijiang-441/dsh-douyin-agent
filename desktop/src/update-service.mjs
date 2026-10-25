@@ -5,18 +5,19 @@ import { createHash, randomUUID } from 'node:crypto';
 export const UPDATE_REPOSITORY='LockyBee/dsh-douyin-agent';
 const API=`https://api.github.com/repos/${UPDATE_REPOSITORY}/releases/latest`;
 export function parseVersion(value){const match=/^v?(\d+)\.(\d+)\.(\d+)$/.exec(value||'');if(!match||match.slice(1).some(item=>!Number.isSafeInteger(Number(item))))return null;return match.slice(1).map(Number);}
-export function newerVersion(next,current){const a=parseVersion(next),b=parseVersion(current);if(!a||!b)return false;for(let i=0;i<3;i++){if(a[i]!==b[i])return a[i]>b[i];}return false;}
+function parseAppVersion(value){if(typeof value!=='string')return null;const match=/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(value);if(!match||match[0]!==value||match.slice(1,4).some(item=>!Number.isSafeInteger(Number(item)))||match[4]?.split('.').some(item=>/^\d+$/.test(item)&&item.length>1&&item.startsWith('0')))return null;return{parts:match.slice(1,4).map(Number),prerelease:match[4]||null};}
+export function newerVersion(next,current){const a=parseVersion(next),b=parseAppVersion(current);if(!a||!b)return false;for(let i=0;i<3;i++){if(a[i]!==b.parts[i])return a[i]>b.parts[i];}return b.prerelease!==null;}
 function githubAsset(value,name){try{const url=new URL(value);return url.protocol==='https:'&&!url.username&&!url.password&&url.host==='github.com'&&url.pathname.startsWith(`/${UPDATE_REPOSITORY}/releases/download/`)&&decodeURIComponent(url.pathname.split('/').at(-1))===name&&!url.search&&!url.hash;}catch{return false;}}
 export class UpdateService {
-  constructor({version,directory,fetchImpl=fetch}={}){if(!parseVersion(version)||!path.isAbsolute(directory))throw new Error('更新版本或下载目录无效。');Object.assign(this,{version,directory,fetchImpl});this.last={currentVersion:version,status:'unchecked'};}
+  constructor({version,directory,fetchImpl=fetch}={}){if(!parseAppVersion(version)||!path.isAbsolute(directory))throw new Error('更新版本或下载目录无效。');Object.assign(this,{version,directory,fetchImpl});this.last={currentVersion:version,status:'unchecked'};}
   state(){const{executable,...safe}=this.last;return{...safe,repository:UPDATE_REPOSITORY};}
   check(){if(this.checking)return this.checking;this.checking=this.performCheck().catch(()=>{this.last={currentVersion:this.version,status:'error',message:'无法检查GitHub更新，请稍后重试。'};return this.state();}).finally(()=>{this.checking=null;});return this.checking;}
   async performCheck(){const response=await this.fetchImpl(API,{headers:{accept:'application/vnd.github+json','user-agent':'Dafeiyu-Douyin-Updater'},redirect:'error',signal:AbortSignal.timeout(15000)});
-    if(response.status===404){this.last={currentVersion:this.version,status:'unpublished',message:'仓库暂未发布可下载的软件版本。'};return this.state();}
+    if(response.status===404){this.last={currentVersion:this.version,status:'unpublished',message:parseAppVersion(this.version).prerelease?`当前测试版 ${this.version}；GitHub 暂未发布可下载的正式版本。`:'仓库暂未发布可下载的软件版本。'};return this.state();}
     if(!response.ok)throw new Error('更新接口不可用');const release=await response.json();
     if(release.draft||release.prerelease||!parseVersion(release.tag_name))throw new Error('没有稳定的软件版本');
     const version=release.tag_name.replace(/^v/,''),name=`Dafeiyu-Douyin-API-${version}-win-x64.exe`,asset=release.assets?.find(item=>item.name===name),checksum=release.assets?.find(item=>item.name===name+'.sha256');
-    if(!newerVersion(version,this.version)){this.last={currentVersion:this.version,latestVersion:version,status:'current',message:'当前已是本机所需的最新版本。'};return this.state();}
+    if(!newerVersion(version,this.version)){this.last={currentVersion:this.version,latestVersion:version,status:'current',message:parseAppVersion(this.version).prerelease?`当前测试版 ${this.version}；GitHub 最新正式版为 ${version}，暂无适用的正式更新。`:'当前已是本机所需的最新版本。'};return this.state();}
     if(!asset||!checksum||!githubAsset(asset.browser_download_url,name)||!githubAsset(checksum.browser_download_url,name+'.sha256')||!Number.isSafeInteger(asset.size)||asset.size<1024||asset.size>500*1024*1024)throw new Error('发布包或校验文件不完整');
     this.candidate={version,name,url:asset.browser_download_url,checksum:checksum.browser_download_url,size:asset.size};
     this.last={currentVersion:this.version,latestVersion:version,status:'available',name,bytes:asset.size,message:`发现${version}，可下载并核对完整性。`};return this.state();

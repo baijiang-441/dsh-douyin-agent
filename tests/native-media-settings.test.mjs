@@ -107,7 +107,7 @@ test('已保存与实际生效分开显示，进程环境或显式配置覆盖�
 
 test('观看、问候或私信服务运行时，原生设置拒绝替换音频凭据', async t => {
   const f = await fixture(t); await f.bootstrap();
-  for (const [kind, value] of [['watch', { running: true }], ['spark', { starting: true }], ['chat', { worker: { alive: true } }]]) {
+  for (const [kind, value] of [['watch', { running: true }], ['spark', { starting: true }], ['chat', { busy: true }]]) {
     f.flags[kind] = value;
     const result = await f.request('/media/credentials', { backend: 'mimo', apiKey: 'synthetic-active-denied' });
     assert.equal(result.status, 409); assert.match(result.body.error, /先停止/); f.flags[kind] = {};

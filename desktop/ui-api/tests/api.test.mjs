@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createApiClient, createForwardGate, mergeEvents, publicSettings, saveNativeSettings, saveNativeMediaKey, watchIsActive, watchStartInput } from '../src/api.mjs';
+import { createApiClient, createForwardGate, mergeEvents, publicSettings, saveNativeSettings, saveNativeMediaKey, watchIsActive, watchStartInput, requestFailure } from '../src/api.mjs';
 
 test('会话凭证只进入本机请求头，bootstrap返回状态不暴露token', async () => {
   const calls = [];
@@ -78,4 +78,32 @@ test('人格保存的版本冲突保留HTTP状态供界面处理，不隐式重�
   await client.bootstrap();
   await assert.rejects(client.request('/api/persona/card', { text: '手编人格', expectedRevision: '旧版本' }), error => error.status === 409 && /版本/.test(error.message));
   assert.equal(calls.filter(call => call.route === '/api/persona/card').length, 1);
+});
+
+test('超时说明操作与读写结果，业务错误保留状态和原始原因，不重试请求', async () => {
+  const calls = [];
+  let mode = 'timeout';
+  const client = createApiClient(async route => {
+    calls.push(route);
+    if (route === '/api/bootstrap') return { ok:true, json:async()=>({service:'douyin-api-local',token:'synthetic-timeout-session'}) };
+    if (mode === 'timeout') throw Object.assign(new Error('signal timed out'), { name:'TimeoutError' });
+    return { ok:false,status:409,json:async()=>({error:'会话身份核对未通过。'}) };
+  });
+  await client.bootstrap();
+  await assert.rejects(client.request('/api/interactions/configure',{enabled:true}), error => error.operation==='设置好友互动' && error.requestError === true && error.unconfirmed === true && /65 秒/.test(error.message) && /勿重复提交/.test(error.message));
+  await assert.rejects(client.request('/api/memory?query=不得回显的私人检索词'), error => /检索共享记忆.*20 秒/.test(error.message) && !error.unconfirmed && !/私人检索词/.test(error.message));
+  mode = 'business';
+  await assert.rejects(client.request('/api/chat/resolve',{recipientId:'合成会话'}), error => error.status === 409 && !error.requestError && /解除会话暂停：会话身份核对未通过/.test(error.message));
+  assert.equal(calls.length,4);
+  const serverTimeout=requestFailure(Object.assign(new Error('signal timed out'),{status:504}),'读取当前会话列表',{write:true,timeoutMs:65_000});
+  assert.equal(serverTimeout.requestError,false); assert.match(serverTimeout.message,/服务处理超时.*signal timed out/);
+});
+
+test('同一写接口只提交一次，响应完成后才能提交下一次', async () => {
+  const pending=Promise.withResolvers(); let writes=0;
+  const client=createApiClient(async route => route==='/api/bootstrap' ? {ok:true,json:async()=>({service:'douyin-api-local',token:'synthetic-busy-session'})} : (writes++,await pending.promise));
+  await client.bootstrap(); const first=client.request('/api/watch/schedule',{enabled:true});
+  await assert.rejects(client.request('/api/watch/schedule',{enabled:false}),error=>error.code==='UI_OPERATION_BUSY');
+  assert.equal(writes,1); pending.resolve({ok:true,json:async()=>({policy:{enabled:true}})}); await first;
+  await client.request('/api/watch/schedule',{enabled:false}); assert.equal(writes,2);
 });

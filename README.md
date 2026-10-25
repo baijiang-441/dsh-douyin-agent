@@ -1,132 +1,94 @@
 # DSH 抖音助手
 
-1.4.4 同步修复插件和软件的分钟数字框，直接显示自主观看停止原因，并补充分享名单入口说明。查看[本版说明](docs/features-1.4.4.md)或[下载 1.4.4 软件与插件包](https://github.com/LockyBee/dsh-douyin-agent/releases/tag/v1.4.4)。包含上一版的设置通信兼容、一键自检、用量看板和主题观看。
+1.4.5 使用说明。插件与独立软件共用人格、兴趣、观看用量和许可名单；独立软件另外提供任务对话。本文的固定安装入口对应 1.4.5，包是否已可下载以 GitHub 和 npm 页面为准。
 
-让 DSH 里的 DeepSeek（大肥鱼）自己刷抖音：搜索、换片、看真实画面，把有意思的内容记下来，并在你许可的范围内分享给好友。
+在本机专用 Microsoft Edge 中浏览抖音电脑版，采样真实画面交给模型，按人格和实际观看行为更新兴趣。这是第三方适配，不是 DeepSeek 官方发行版。
 
-在专用 Edge 里浏览电脑网页版抖音，每隔几秒采样视频画面交给模型。所有外发功能默认关闭，每一项都有独立开关、次数上限和时间限制。这是第三方适配，不是 DeepSeek 官方出品。
+## 功能
 
-## 能做什么
+| 功能 | 用法与范围 |
+| --- | --- |
+| 自主观看 | 开启“允许自动观看”后，在允许时段和每日额度内挑片、停留、换片或停止；保留手动启动／暂停按钮 |
+| 每日额度 | “高级选项”内设置每日观看分钟数和每日模型请求数，均可选不限 |
+| 人格与兴趣 | 两版共用人格卡；兴趣依据实际播放进度、观看比例和已确认互动，看到主题不等于喜欢 |
+| 好友互动 | 一个总开关管理许可会话的新消息回复及观看中的自主分享，默认开启；须由本人选择许可好友或群聊 |
+| 群聊回复 | 仅回复已许可群聊中被 @ 或叫到设定昵称的消息 |
+| 自主分享 | 通过官方面板发送当前实际观察作品的卡片，按平台稳定身份绑定收件人，同作品同会话去重 |
+| 公开评论 | 独立开关，默认关闭；保留每日及每次观看的尝试上限，同作品不重复评论 |
+| 静默观看 | 持续静音，核实窗口归属后尝试最小化；仍使用有窗口 Edge |
+| 自检与用量 | 一键诊断、限定修复建议、实际请求与已报告 token 用量、进行中状态 |
+| 观看日报 | 从本机观看记录生成 Markdown，不额外调用模型 |
+| 可选音频 | 本地 Whisper 转写对白，视频音频还可选择 MiMo 或 MiniMax 云端后端 |
 
-| 功能 | 说明 | 默认 |
-| --- | --- | --- |
-| 自主观看 | 按人格和兴趣自己搜索、换片、继续看或停止，并给出理由；可配置每个允许时段自动开始一轮 | 自动启动关闭 |
-| 兴趣与人格 | 兴趣来自实际观看进度和已确认行为，不是看到主题就算喜欢 | 随观看自动积累 |
-| 时间限制 | 每日允许时段（北京时间）加单轮时长，到点视频真的暂停 | 单轮 10 分钟 |
-| 静默观看 | 静音，核对窗口归属后尝试最小化（仍是有窗口的 Edge，不是 headless） | 关闭 |
-| 观看日报 | 把当天实际看过的标题、作者、链接汇总成 Markdown，不调用模型 | 可手动生成，每轮观看结束后也会尝试生成 |
-| 主动分享 | 通过官方分享界面把当前看过的作品发给许可好友，每天默认 3 次 | 关闭 |
-| 自动问候 | 每位许可好友每天最多一次，合计默认 2 次，带「自动问候」标记 | 关闭 |
-| 私信自动回复 | 只处理你确认的最多两位好友，只回复启动之后的新消息 | 关闭 |
-| 公开评论 | 每天默认 3 条，每轮 1 条，同一作品只评论一次 | 关闭 |
-| 音频理解 | 本地 Whisper 转写对白，可选 MiMo 或 MiniMax 云端 | 关闭 |
-
-发送结果不确定时一律暂停，不会自动重发。
+好友互动不设人数、回复请求数或分享次数的业务上限，模型调用仍会消耗额度。默认开启总开关不会自行添加许可会话。旧自动续火花／自动问候入口已移除。
 
 ## 两种用法
 
 | | 插件版 | 软件版 |
 | --- | --- | --- |
-| 在哪用 | DSH 的「设置 → 刷抖音」，全部用按钮操作 | 独立的 Windows 桌面软件，对话式下任务 |
-| 模型 | 用 DSH 里已配置的提供商 | 用你自己填的 DeepSeek API Key |
-| 版本 | 1.4.4 | 1.4.4 Windows 便携包，见 [软件说明](desktop/README.md) |
+| 入口 | DSH“设置 → 刷抖音”分类设置页 | Windows 独立软件的分类设置和任务对话 |
+| 主模型 | DSH 已配置的提供商与支持图片的模型 | 自己填写的 API Key、接口地址和模型 |
+| 运行依赖 | 兼容的 DSH 宿主 | 无需安装或启动 DSH、QQ 服务或 Node.js |
+| 文档 | [插件说明](docs/plugin.md) | [软件说明](desktop/README.md)、[本机 API 说明](docs/standalone-api.md) |
 
-两者共用同一份人格、兴趣和记忆，但同一时刻只会运行一个自主观看。
+同一时刻只运行一条自主观看。两版共享每日账本，暂停、重启或改设置不会清空当天用量。
 
-## 快速开始（插件版）
+## 安装 1.4.5
 
-1.4.3 包含“没有可用的同源设置服务”兼容修复，适配常用桌面载体、Connection 设置路由和刷新恢复。更新后请完全退出并重开 DSH，无需删除记忆、登录目录或重填 Key。各第三方宿主仍以实际自检结果为准，见[验证记录](docs/verification/settings-compatibility-20261023.md)。
+DSH Desktop：打开“应用 → 桌面插件”，填写 `dsh-douyin-browser-local@1.4.5` 安装或更新。Desktop profile 由 Electron 管理，不要用普通 CLI 另改一份。更新后完全退出并重新打开同一份 DSH。
 
-### npm 安装或更新（1.4.4）
-
-DSH Desktop：打开“应用 → 桌面插件”，在 npm 包输入框填写 `dsh-douyin-browser-local@1.4.4`，点击安装或更新。Desktop profile 由 Electron 管理，不能用普通 CLI 修改。完成后完全退出并重开 DSH。
-
-Web 版在终端运行：
+Web profile 在终端执行：
 
 ```powershell
-dsh plugin --profile web add dsh-douyin-browser-local@1.4.4
+dsh plugin --profile web add dsh-douyin-browser-local@1.4.5
 ```
 
-需要 Windows、Microsoft Edge 和 DSH 0.2.0-rc.2 至 0.2.x 兼容宿主。抖音登录和验证由使用者自行完成。npm、GitHub Release 和社区市场分别同步；市场未更新时可使用固定版本号安装。
+插件需要 Windows、Microsoft Edge 和兼容 DSH。已检查 0.2.0-rc.2、0.2.1-rc.2 两代 SDK；完整允许版本以 `package.json` 的 `engines.dsh` 为准，不笼统保证任意 0.2.x 预发布宿主。设置通信适配常用 WebServer、Connection 与宿主 RPC 入口，第三方宿主仍以实际自检和加载结果为准。npm、GitHub Release 和插件市场分别同步；市场未更新时可核对固定 npm 版本。
 
-### 从源码安装
+独立软件及校验文件见 [1.4.5 下载页](https://github.com/LockyBee/dsh-douyin-agent/releases/tag/v1.4.5)，文件名为 `Dafeiyu-Douyin-API-1.4.5-win-x64.exe`。正常退出旧版后打开新版，保留共享记忆、登录目录和本机设置。便携包未签名，要求及更新说明见 [desktop/README.md](desktop/README.md)。
 
-
-需要 Windows、Microsoft Edge、Node.js 22.13 以上，以及 DSH 0.2.0-rc.2 系列（已在 DSH Desktop 2.0.17 上核对过设置页）。
+从源码安装插件需要 Node.js 22.13+、pnpm 和已核对路径的 DSH：
 
 ```powershell
 git clone https://github.com/LockyBee/dsh-douyin-agent.git
 cd dsh-douyin-agent
 pnpm install --frozen-lockfile
-$dshInstallDirectory = 'C:\Apps\DSH Desktop' # 替换为正在使用的 DSH 安装目录
+$dshInstallDirectory = 'C:\Apps\DSH Desktop' # 替换为实际安装目录
 .\install-native.ps1 -DshRoot $dshInstallDirectory
 ```
 
-第一条命令安装依赖；不带 `-Install` 的脚本只做检查，不改配置也不开窗口。确认无误后完全退出 DSH，再执行：
+不带 `-Install` 只检查。确认无误、完全退出 DSH 后再执行：
 
 ```powershell
 .\install-native.ps1 -DshRoot $dshInstallDirectory -Install
 ```
 
-重新打开 DSH，在「设置」里找到「刷抖音」，按这个顺序用：
+## 第一次使用
 
-1. 基础设置：选提供商和模型（模型必须支持图片），保存。
-2. 视频观看：点「打开抖音」，在专用 Edge 里自己登录或过验证。
-3. 设置允许时段和单轮时长，点「开始有限轮次」，再点「开始自主观看」。
+1. 配置支持图片的主模型。插件从 DSH 目录选择；独立软件在模型设置的密码框填写自己的 Key。
+2. 点击“打开抖音”，在专用 Edge 中手动登录或完成验证码。
+3. 在“视频观看”选择时段，按需展开“高级选项”设置每日分钟数和请求数，再开启“允许自动观看”。无需先开始新轮次，应用需保持运行。
+4. 在“好友互动”读取当前会话，核对稳定身份并勾选许可好友或群聊，按需填写群聊响应昵称。总开关开启且模型、名单就绪后自动准备回复；观看中可自主分享。
 
-安装细节和本机现有入口的说明见 [插件说明](docs/plugin.md)。
+普通设置自动保存，文本输入离开输入框后提交，开关和下拉选择修改后提交，以页面回读为准；失败会保留草稿。密钥保留独立保存入口：桌面主模型 Key 走桌面 IPC；音频 Key 在“音频与密钥”密码框填写，离开后通过专用接口保存，不回显，也不会因此开启音频。
 
-## 当前验证状态
+## 状态与验证边界
 
-| 状态 | 内容 |
-| --- | --- |
-| 真实环境验证过 | 推荐播放、搜索、上下切换、暂停、画面采样、限时到点暂停；旧版 DSH 原生工具调用；表情图片采样；一次人工授权的好友转发；DSH 2.0.17 中设置页挂载并读回状态 |
-| 通过专项或合成测试 | 自主分享、行为偏好、自动问候、自主评论、静默修复及日报；不代表全部真实外发已验证 |
-| 还没验证 | 抖音最小化后的持续播放、真实评论区、收到新私信后的完整自动回复、MiMo 与 MiniMax 云端、标准 bundle 安装 |
+顶部状态栏区分在线、观看中、准备中和需要处理。未确认发送、身份不符或待人工处理的消息会显示原因；不能只凭总开关开启认定服务已就绪。好友回复与观看分开运行，观看时仍检查许可会话的新消息，实际速度受页面读取和模型耗时影响。
 
-合成测试用的是替身模型和临时页面，不能当作真实抖音上能用的证据。1.4.4 的输入、停止原因与名单提示检查见[本版验证记录](docs/verification/ui-feedback-20261023.md)。上一版专项检查、实机自检和完整回归首轮失败记录见[1.4.3 验证记录](docs/verification/local-1.4.3-20261023.md)；[v10 记录](docs/verification/native-v10.md)仅对应旧版本。
+遇到问题先运行“自检与用量 → 一键自检”，按报告处理限定修复项。登录、验证码、无效 Key、损坏记录和宿主适配不能靠删除锁、记忆或登录目录解决。发送结果不确定时保留收据，等待人工核对，不自动重发。
 
-## 目录
+本机已核对浏览、采样、暂停、真实模型人格候选和受控卡片流程，稳定身份、最终输入、每日账本及自动保存另有隔离测试。真实群聊、长期连续运行及本轮更新后的新私信自动回复仍需单独实测；MiMo／MiniMax 云端和真实公开评论也不能视为已验收。
 
-| 位置 | 内容 |
-| --- | --- |
-| `dsh-plugin.mjs`、`client.js`、`cordis.bundle.yml` | 原生插件入口、设置页前端、标准 bundle 声明 |
-| `tool-definitions.mjs` | 34 项工具目录，插件和软件共用 |
-| `native-*.mjs` | 设置页后端、模型路由、人格注入、问候与观看决策 |
-| `core.mjs`、`browser-*.mjs` | 专用 Edge 的控制、采样、限时 |
-| `video-limits.mjs`、`task-limits.mjs`、`watch-mode.mjs` | 时段与轮次、任务预算、静默 |
-| `autonomous-*.mjs`、`spark-*.mjs`、`daily-report.mjs` | 自主观看、分享、评论、问候、日报 |
-| `chat-*.mjs`、`message-tracker.mjs`、`outbound-send.mjs` | 私信自动回复和统一的发送账本 |
-| `memory.mjs`、`persona-memory.mjs`、`qq-sync.mjs` | 共享记忆、人格卡、QQ 侧同步 |
-| `app.mjs`、`api-agent.mjs`、`public/`、`start-api.*` | 旧的本机 HTTP 控制台（`http://127.0.0.1:3218`） |
-| `desktop/` | Electron 桌面软件的源码、打包脚本和上游许可证 |
-| `media/` | 可选音频模块，内置三份社区项目源码 |
-| `tests/`、`verification/` | 单元测试，以及实机验收脚本 |
-| `skill/SKILL.md` | 给模型看的使用说明 |
+后台打开浏览器仍有偶发超时，尚未根治；最小化后的持续播放受网站行为影响。历史某次发送或旧版测试不代表所有账号、宿主和消息类型都通过。记录见 [验证目录](docs/verification/)、[软件验证说明](desktop/VERIFICATION.md)，保留各自日期和版本。
 
-## 文档
-
-| 文档 | 内容 |
-| --- | --- |
-| [插件说明](docs/plugin.md) | 插件安装、设置页逐项说明、预算、各项外发的规则 |
-| [独立软件说明](docs/standalone-api.md) | 独立 API 控制台和软件版的配置 |
-| [详细说明](docs/details.md) | 原 README 全文，按时间累积，内容多 |
-| [功能复用与来源](docs/reuse.md) | 参考和复用的开源项目，以及边界 |
-| [docs/verification/](docs/verification) | 各版本的测试记录 |
-| [desktop/README.md](desktop/README.md) | 桌面软件的构建和使用 |
-| [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 第三方许可证 |
-
-## 开发
+## 开发与来源
 
 ```powershell
 pnpm test
 pnpm run test:native
 ```
 
-`pnpm test` 会起临时 Edge 页面，不碰真实抖音和你的账号。运行状态、浏览器资料、密钥、数据库、私信正文和联系人信息都只保存在本机，不进入仓库。
+测试使用临时目录、合成模型或临时浏览器，不应把测试通过写成真实平台联调通过。运行状态、Key、登录资料、私信及联系人记录不进入仓库。
 
-## 许可证
-
-本项目原创代码采用 [MIT](LICENSE)。第三方源码和依赖的原许可证、版权及通知见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-公开准备、分发包检查与社区市场申请见 [发布记录](docs/publication.md)。
+浏览器控制复用 Playwright；来源见 [功能复用与来源](docs/reuse.md)、[软件来源](desktop/UPSTREAM.md)。原创代码采用 [MIT](LICENSE)，第三方通知见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。模型使用说明见 [skill/SKILL.md](skill/SKILL.md)，历史详细资料见 [docs/details.md](docs/details.md)。

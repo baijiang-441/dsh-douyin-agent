@@ -14,7 +14,7 @@ async function fixture(t) {
   let clock = Date.parse('2026-10-14T02:00:00Z');
   const videoLimits = new VideoLimits({ stateDir: directory, now: () => clock });
   const contacts = [{ id: 'synthetic-friend', name: '合成好友', followed: true, isGroup: false }, { id: 'synthetic-other', name: '名单外合成好友', followed: true, isGroup: false }, { id: 'synthetic-group', name: '合成群聊', followed: true, isGroup: true }];
-  let allowlist = [contacts[0]]; let settings = { enabled: false, backend: 'local-whisper' }; const settingsCalls = []; const executes = []; let executor = async () => ({ confirmed: true }); let contactsHook = async () => {};
+  let allowlist = [{ ...contacts[0], verifiedAt: '2026-10-14T02:00:00.000Z' }]; let settings = { enabled: false, backend: 'local-whisper' }; const settingsCalls = []; const executes = []; let executor = async () => ({ confirmed: true }); let contactsHook = async () => {};
   const chatService = { state: () => ({ policy: { allowlist, dailyReplyLimit: 40 }, daily: { requests: 0, limit: 40 }, running: false, contacts: [], events: [], pollSeconds: 15, replyTokens: 512 }), listContacts: async () => { await contactsHook(); return { contacts }; }, close: async () => {} };
   const mediaAdapter = { status: async () => ({ ...settings, backends: { 'local-whisper': { available: true }, minimax: { available: false }, mimo: { available: false } } }), saveSettings: async (value, options) => { settingsCalls.push({ value, options }); settings = { ...value }; } };
   const controller = { execute: async (name, args, options) => { executes.push({ name, args, options }); return executor(name, args, options); } };
@@ -65,11 +65,11 @@ test('明确按钮转发传可信 humanAuthorized；链接去掉查询串，当�
 test('关系核对期间撤销许可会拒绝；到点取消进行中转发，单次未确认不盲目重试', async t => {
   const f = await fixture(t); f.videoLimits.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: 1 }, { explicit: true }); f.videoLimits.markSession('api', { explicit: true });
   f.setContactsHook(async () => f.allow([])); assert.equal((await f.request('/api/forward', { recipientId: 'synthetic-friend' })).status, 403); assert.equal(f.executes.length, 0);
-  f.allow([{ id: 'synthetic-friend', followed: true, isGroup: false }]); f.setContactsHook(async () => {});
+  f.allow([{ id: 'synthetic-friend', name: '合成好友', followed: true, isGroup: false, verifiedAt: '2026-10-14T02:00:00.000Z' }]); f.setContactsHook(async () => {});
   const entered = Promise.withResolvers(); f.setExecutor(async (_name, _args, { signal }) => { entered.resolve(); return new Promise(resolve => signal.addEventListener('abort', () => resolve({ confirmed: false, deliveryUncertain: true }), { once: true })); });
-  const request = f.request('/api/forward', { recipientId: 'synthetic-friend' }); await entered.promise;
+  const request = f.request('/api/forward', { recipientId: 'synthetic-friend' }); await Promise.race([entered.promise, request.then(result => { throw new Error(`发送器尚未进入，请求已返回 ${result.status}`); }), new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('等待合成发送器超时。')), 5000); timer.unref(); })]);
   assert.equal((await f.request('/api/forward', { recipientId: 'synthetic-friend' })).status, 409);
-  f.advance(60_000); await f.server.enforceVideoLimits(); const result = await request; assert.equal(result.body.confirmed, false); assert.equal(result.body.deliveryUncertain, true); assert.equal(f.executes.length, 1);
+  for(let second=0;second<60;second++){f.videoLimits.notePlayback('api',{video:{paused:false,readyState:4}});f.advance(1000);} await f.server.enforceVideoLimits(); const result = await request; assert.equal(result.body.confirmed, false); assert.equal(result.body.deliveryUncertain, true); assert.equal(f.executes.length, 1);
 });
 
 test('临时真 Edge 页面可以开关音频并用合成好友明确点一次转发，不接触真人联系人', { skip: process.env.DOUYIN_UI_TEST !== '1' }, async t => {

@@ -38,7 +38,7 @@ async function fixture(t) {
     if (name === 'douyin_forward_video') return { confirmed: false, deliveryUncertain: false, humanActionRequired: true };
     return { video: { id: '7579432563794584933', title: '合成作品', paused: false } };
   }, pauseForLimits: async () => { f.pauses++; return { paused: 0, existingPage: false }; }, close: async () => {} };
-  const contact = { id: recipientId, name: '合成许可好友', followed: true, isGroup: false };
+  const contact = { id: recipientId, name: '合成许可好友', followed: true, isGroup: false, authorizationKind: 'following', verifiedAt: '2026-10-24T00:00:00.000Z' };
   const chatService = { state: () => ({ policy: { allowlist: [contact] } }), listContacts: async () => { f.contactEntered?.resolve(); await f.contactWait?.promise; return { contacts: [contact] }; }, close: async () => {} };
   const watchService = { state: () => ({ running: f.watchRunning, owned: false, worker: null }), claimManual: () => async () => {}, cancel: () => {}, close: async () => { f.watchRunning = false; } };
   const shareService = { active: null, close: async () => {} };
@@ -117,7 +117,14 @@ test('活动任务、自主观看、转发与分享忙碌时预算不可改，�
   f.watchRunning = true; assert.equal((await f.request('/api/task/limits', next)).status, 409); f.watchRunning = false;
   f.shareService.active = {}; assert.equal((await f.request('/api/task/limits', next)).status, 409); f.shareService.active = null;
   f.contactEntered = Promise.withResolvers(); f.contactWait = Promise.withResolvers();
-  const forward = f.request('/api/forward', { recipientId }); await f.contactEntered.promise;
+  const forward = f.request('/api/forward', { recipientId }); let contactTimer;
+  try {
+    await Promise.race([
+      f.contactEntered.promise,
+      forward.then(response => { throw new Error(`合成转发在进入联系人核对前已返回 HTTP ${response.status}：${JSON.stringify(response.body)}`); }),
+      new Promise((_, reject) => { contactTimer = setTimeout(() => reject(new Error('合成转发未在限定时间内进入联系人核对。')), 2000); }),
+    ]);
+  } finally { clearTimeout(contactTimer); }
   try { assert.equal((await f.request('/api/task/limits', next)).status, 409); assert.deepEqual(fs.readFileSync(f.taskLimits.policyFile), saved); }
   finally { f.contactWait.resolve(); }
   assert.equal((await forward).status, 200); assert.equal((await f.request('/api/task/limits', next)).status, 200); assert.deepEqual((await f.request('/api/task/limits')).body.policy, next);
@@ -133,9 +140,9 @@ test('预算文件损坏时HTTP拒绝读写，重建也保留原字节与视频�
 });
 
 test('提高任务预算不能越过视频截止，运行中到点取消且不自动开启新轮', async t => {
-  const f = await fixture(t); await f.request('/api/task/limits', policy); const session = f.videoLimits.state().session;
+  const f = await fixture(t);f.videoLimits.savePolicy({windows:['11:00-11:10']},{explicit:true});await f.request('/api/task/limits', policy);const session=f.videoLimits.state().session;
   const stopped = await f.runTask('expire-video'); assert.equal(stopped.status, 'stopped'); assert.equal(f.requests.length, 2); assert.equal(f.executed.filter(name => name === 'douyin_next').length, 1);
-  const after = f.videoLimits.state(); assert.equal(after.allowed, false); assert.equal(after.session.id, session.id); assert.equal(after.session.expiresAt, session.expiresAt);
+  const after = f.videoLimits.state(); assert.equal(after.allowed, false); assert.equal(after.session.id, session.id); assert.equal(after.reasonCode,'outside-window');assert.equal(after.window,null);
   const count = f.requests.length; assert.equal((await f.request('/api/task', { instruction: '过时段不得重开任务。' })).status, 409); assert.equal(f.requests.length, count);
   assert.deepEqual((await f.request('/api/task/limits')).body.policy, policy); assert.equal((await f.readBootstrap()).limits.taskTimeoutSeconds, 600);
 });
