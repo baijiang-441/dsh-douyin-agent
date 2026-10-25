@@ -79,3 +79,20 @@
 
 市场索引与npm分别同步，本次没有修改或重新验收市场条目。需要固定版本时在Desktop的npm包入口填写`dsh-douyin-browser-local@1.4.4`，更新后完全退出并重开DSH。功能与验证边界见[本版说明](features-1.4.4.md)和[输入、停止原因与名单记录](verification/ui-feedback-20261023.md)。
 
+## 2026-10-25 1.4.5 公开发布与市场同步
+
+用户授权将本地修复同步社区。正式源码提交为 `17676b0abba03da6e2181f23d7f4e8cea75882ea`，标签和产品版本统一为 1.4.5；此前 beta.1、beta.2 及早期内部标签保留作验证历史。
+
+- [GitHub Release v1.4.5](https://github.com/LockyBee/dsh-douyin-agent/releases/tag/v1.4.5) 已公开，非预发布，并设为 latest。EXE、SHA256 文件和插件 tarball 三份附件的长度与 GitHub 计算的 digest 逐一匹配本地审查文件。
+- 正式 EXE 为 124659712 字节，SHA256 为 `bfad5fd9b9f0cf03eaf28b97c2eedd36007a44191e680d0174c78ab47b60d427`。正式包重新通过版本、39 份领域文件、图标、隔离启动、实际界面设置、诊断、15 个只读接口和正常退出检查，页面错误 0，退出后后台端口释放。检查使用隔离配置，没有真实模型调用或外发。运行内容摘要为 `1dc99e9776d50492ff91d64466fb9ce01f3f3ef184141b676630e829c60c5645`。
+- [npm 1.4.5](https://www.npmjs.com/package/dsh-douyin-browser-local/v/1.4.5) 已公开，公共 registry 的版本与 latest 均为 1.4.5；没有遗留待发布 stage。包含 106 个文件、661527 字节，SHA512 integrity 为 `sha512-i0UarPWsbcr0ZsW3y0iDk/AFvWvynKoR2HiANAxVR/UirMuf4TS0VmEgDGxCpZsxwEACHxFMXOnqEPaHkegM4A==`。匿名重新下载后的字节数和完整性与本地 tarball 一致。首次回读等待 registry 同步；首次安装未完成，强制刷新包元数据后在新目录从公共 registry 安装成功，原生 apply、34 项工具、bundle 和相对模块均可读取，没有使用 legacy-peer-deps 绕过解析。
+- 发布前 61 项插件、SDK、状态与更新相关检查通过；38 份业务领域文件与本地 beta.2 完全相同，另一份诊断文件和前端构建仅产品版本变化。两代已验证 DSH SDK 的预发布版本分支已显式声明并核对，不承诺任意预发布宿主。
+- 公开源码候选审查 169 个文件；一条刻意验证拒绝密钥输入的测试样本按精确行摘要确认，未作为真实凭据发布。公开插件包扫描未发现凭据模式，静态相对模块依赖完整。原始私信、联系人、记忆、浏览器资料、本机诊断脚本、配音素材和 QQ 合并启动器没有加入源码提交或发布包。此项不等于对任意隐藏引用的全面安全证明。
+- 软件更新器以旧版 1.4.4 执行真实 GitHub 检查，识别到 1.4.5 及正确文件大小；匿名下载公开 SHA256 文件并核对通过。本轮没有通过更新器再次下载和安装整个 EXE，不将更新检查说成完整升级链路验收。
+
+市场简介已提交 [awesome-dsh-plugin PR #9262](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/9262)，仅修改原条目的中英文描述，去掉旧问候和独立许可用法，补充每日额度、共用互动名单、群触发、自检与用量。当前社区 6896 条结构校验通过；社区检查仍在运行，未声称已合并。
+
+本次实时读取官方 `plugins.json` 时，条目存在且已映射 npm 包，安装命令为 `dsh plugin --profile web add dsh-douyin-browser-local`，但显示版本仍为 1.4.4、简介仍旧，等待社区审核及索引构建。需要立即更新可使用固定版本 `dsh-douyin-browser-local@1.4.5`；市场界面的实际刷新与安装尚未额外验收。没有向条目添加不受支持的 npm 字段，也没有手工改生成 README。
+
+本轮没有中断用户正在运行的本地预览、修改许可名单或清空预算。功能与已知限制见 [1.4.5 使用说明](features-1.4.5.md) 和 [候选实机验证](verification/local-1.4.5-beta.2-20261025.md)。本机原始发布回执位于忽略目录 `verification/release-1.4.5/`，不随包上传。
+

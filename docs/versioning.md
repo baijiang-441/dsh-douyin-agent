@@ -1,6 +1,6 @@
 # 版本与发布
 
-2026-10-25 准备正式版 1.4.5，插件和独立软件使用同一个产品版本。公开状态以 [GitHub Releases](https://github.com/LockyBee/dsh-douyin-agent/releases) 和 npm registry 为准，发布核验结果另记 [publication.md](publication.md)。
+2026-10-25 已公开正式版 [1.4.5](https://github.com/LockyBee/dsh-douyin-agent/releases/tag/v1.4.5)，插件和独立软件使用同一个产品版本。npm 公共 registry 的版本及 latest 均已核对为 1.4.5，市场简介提交独立审核，详见 [publication.md](publication.md)。
 
 1.4.5-beta.1、beta.2 是本轮本地验证构建。后续未发布改动继续使用下一正式版本下的 beta 编号，完成验证后再发布正式版。
 
