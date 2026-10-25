@@ -78,7 +78,9 @@ test('通知订阅在旧消息基线后启用，停止时清理且迟到通知�
   assert.equal(f.reads(), before); assert.equal(f.sent.length, 1); assert.equal(f.service.timer, null);
 });
 
-test('生成期间到达新消息只补扫一次，不并行生成或发送过时回复', async t => {
+// ng（2026-10-26）：随本地补丁 v2「认人不认水位」更新断言——生成期间的新消息不再作废本轮回复，
+// 先照发第一轮，再只补扫一次处理补充消息；仍不并行生成。
+test('生成期间到达新消息：本轮照发，补扫只补一次，不并行生成', async t => {
   const entered = Promise.withResolvers(), gate = Promise.withResolvers();
   let calls = 0, active = 0, maximum = 0;
   const f = fixture(t, { agent: { reply: async () => {
@@ -90,9 +92,9 @@ test('生成期间到达新消息只补扫一次，不并行生成或发送过�
   await entered.promise;
   f.messages.push(incoming('second', '生成期间补充问题'));
   for (let i = 0; i < 25; i++) f.service.notifyIncoming(contact.id);
-  gate.resolve(); await until(() => f.sent.length === 1); await idle(f.service);
-  assert.equal(calls, 2); assert.equal(maximum, 1); assert.equal(f.sent.length, 1);
-  assert.equal(f.sent[0].text, '合成回复2'); assert.equal(f.service.state().daily.requests, 2);
+  gate.resolve(); await until(() => f.sent.length === 2); await idle(f.service);
+  assert.equal(calls, 2); assert.equal(maximum, 1); assert.equal(f.sent.length, 2);
+  assert.equal(f.sent[0].text, '合成回复1'); assert.equal(f.sent[1].text, '合成回复2'); assert.equal(f.service.state().daily.requests, 2);
 });
 
 test('异步通知订阅在停止之后才返回时立即清理，不挂回旧服务', async t => {

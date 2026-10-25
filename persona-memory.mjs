@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
-import { store } from './lib/store.mjs';
 
 export const LEGACY_ROLE_CARD_FILE = 'D:/codex分局/大肥鱼/persona/role-card.md';
 export const GENERATED_START = '<!-- DOUYIN_PERSONA_GENERATED:START -->';
@@ -263,8 +262,9 @@ export class PersonaMemory {
   writeState(state) {
     const raw = JSON.stringify(state, null, 2) + '\n';
     if (Buffer.byteLength(raw) > MAX_STATE_BYTES) throw error('PERSONA_CAPACITY', '人格证据达到文件上限，本次没有丢弃旧证据或伪造保存。');
-    // ng（2026-10-26）：经统一存储层写入，EPERM 类平台拦截在退避重试后转入内存缓冲，不让观看/记录轮次直接死。
-    store.writeSync(this.stateFile, raw);
+    // ng（2026-10-26）注：人格 state 首次提交是事务性里程碑，保持上游「失败即抛」的契约
+    // （tests/persona-memory.test.mjs 明确覆盖：中断后保全旧卡、重试不重复导入），不接入存储层降级。
+    atomic(this.stateFile, raw);
   }
   syncCard(state) {
     const raw = read(this.roleCardFile, MAX_CARD_BYTES, true);
@@ -272,14 +272,7 @@ export class PersonaMemory {
     const next = assemble(cardParts(raw), state);
     if (Buffer.byteLength(next) > MAX_CARD_BYTES) throw error('PERSONA_CAPACITY', '人格卡超过长度上限，已保留手编内容。');
     if (read(this.roleCardFile, MAX_CARD_BYTES, true) !== raw) throw error('PERSONA_REVISION_CONFLICT', '人格卡刚被手工修改，请重新读取后再更新。');
-    if (next !== raw) {
-      try { atomic(this.roleCardFile, next, { expected: raw }); }
-      catch (failure) {
-        if (!['EPERM', 'EACCES', 'EROFS', 'ENOSPC', 'EBUSY', 'ETXTBSY', 'EIO'].includes(failure.code)) throw failure;
-        // ng（2026-10-26）：写不进去时把拟写入内容转入存储层缓冲，存储恢复后回放最新一份；不阻塞本轮。
-        store.deferWrite(this.roleCardFile, next);
-      }
-    }
+    if (next !== raw) atomic(this.roleCardFile, next, { expected: raw });
     return true;
   }
   initialize({ importLegacy = false } = {}) {

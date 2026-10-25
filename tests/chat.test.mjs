@@ -87,9 +87,11 @@ test('用户已发出回复时不再自动回复；发出的消息不会触发�
   f.messages.push(message('incoming-new', '请问在吗'), message('human-reply', '本人已经回复', 'outgoing'));
   await f.service.poll(); assert.equal(f.inputs.length, 0); assert.equal(f.sent.length, 0);
 });
-test('生成回复期间有人手动发送消息时取消本次自动发送', async (t) => {
-  let f; f = fixture(t, { agent: { reply: async () => { f.messages.push(message('human-late', '本人已处理', 'outgoing')); return { text: '[自动回复] 不应发送' }; } } });
-  await prepare(f); f.messages.push(message('new', '新问题')); await f.service.poll(); await f.service.poll(); assert.equal(f.sent.length, 0);
+// ng（2026-10-26）：随本地补丁 v2「认人不认水位」更新断言——生成期间本人手动发出的消息
+// 吸收进水位、不作废本轮自动回复；只有目标消息被撤回/改动才拦截。
+test('生成回复期间本人手动发送消息：吸收进水位，自动回复照发', async (t) => {
+  let f; f = fixture(t, { agent: { reply: async () => { f.messages.push(message('human-late', '本人已处理', 'outgoing')); return { text: '[自动回复] 应当发送' }; } } });
+  await prepare(f); f.messages.push(message('new', '新问题')); await f.service.poll(); await f.service.poll(); assert.equal(f.sent.length, 1);
 });
 test('发送未确认后挂起联系人，重启和重复轮询均不盲目重发', async (t) => {
   const f = fixture(t, { browser: { sendMessage: async () => ({ confirmed: false, deliveryUncertain: true }) } });

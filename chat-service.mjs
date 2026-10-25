@@ -527,8 +527,10 @@ export class ChatService {
           assertConversationSnapshot(contact, latestSnapshot);
           const latest = messagesOf(latestSnapshot);
           if (latest.some((item) => item.sender === 'unknown') || incoming.some((item) => !latest.some((current) => current.id === item.id && current.sender === 'incoming' && messageFingerprint(current)===messageFingerprint(item)))) { mark.pending.phase = 'superseded'; mark.pending.readback = latest.filter((item) => incoming.some((before) => before.id === item.id)).map((item) => ({ id: item.id, sender: item.sender, kind: item.kind, text: item.text })); throw new Error('待回复消息在生成期间被撤回、改动或方向不明，未发送。'); }
-          // 本地补丁 v2（2026-10-25，爸爸定规矩）：只认会话对象（白名单稳定绑定）；生成期间的新消息与旧记录补载都不再作废回复，全部吸收进水位。上一处「目标消息被撤回/改动」的核对保留。
-          for (const item of latest) if (!mark.seen.includes(item.id)) mark.seen.push(item.id);
+          // 本地补丁 v2（2026-10-25，爸爸定规矩）：只认会话对象（白名单稳定绑定）；生成期间的新消息与旧记录补载都不再作废回复。上一处「目标消息被撤回/改动」的核对保留。
+          // ng 修正（2026-10-26）：原 v2 把生成期间新到的 incoming 一并塞进 seen，这条消息会被当作已处理而永不回复；
+          // 改为只吸收非 incoming（本人手发与旧记录补载），新到的 incoming 留给紧接着的补扫轮各自回复——本轮照发不误。
+          for (const item of latest) if (item.sender !== 'incoming' && !mark.seen.includes(item.id)) mark.seen.push(item.id);
           mark.seen = mark.seen.slice(-2000); this.persist();
           await this.deliverReply(contact, mark, reply, latest, signal);
         } catch (error) {
