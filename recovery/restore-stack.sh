@@ -17,9 +17,11 @@
 #   2) pip install --break-system-packages python-xlib（ui_check/xshot/xclick 依赖）
 #   3) 把本目录 bootguard.sh（本地适配版，含 EVENTS_FILE 覆盖）装到 /root/bootguard.sh
 #   4) 以旧树口径跑 bootguard 全流程：PREFERRED_TREE=old + EVENTS_FILE 旧树事件文件 + UI_HOOK
-#   5) 跑 bootguard-loop.sh 重挂监督环（120 秒一轮，经 bootwatch 健康门）
-#   6) 重拉 list_pin（setsid + nohup 后台长跑，已在跑则跳过）
-#   7) 从 agent /api/bootstrap 取新 token 存回 agent_token.txt（只报成功与否，绝不打印 token）
+#   5) 从 agent /api/bootstrap 取新 token 存回 agent_token.txt（只报成功与否，绝不打印 token）
+#      ——必须排在挂监督环之前：bootwatch 靠该文件判活，拿旧 token 会误判不健康、
+#        多跑一轮 bootguard 全流程并多停启一次私信服务（2026-10-26 实测教训）
+#   6) 跑 bootguard-loop.sh 重挂监督环（120 秒一轮，经 bootwatch 健康门）
+#   7) 重拉 list_pin（setsid + nohup 后台长跑，已在跑则跳过）
 #   8) 自检并打印：桥 /health、agent bootstrap、私信 chat/state 是否 running
 
 set -u
@@ -82,38 +84,41 @@ grep -q 'EVENTS_FILE=' /root/bootguard.sh || LOG "WARN: /root/bootguard.sh 里�
 
 # ---------- 4) bootguard 全流程 ----------
 LOG "步骤 4：跑 bootguard 全流程（PREFERRED_TREE=old）"
+# 注意：不能用 `| tee` 接 bootguard 的输出——它拉起的常驻进程会占着管道写端，
+# tee 等不到 EOF、脚本会卡死在这一步（2026-10-26 实测缺陷）。直写日志文件。
 PREFERRED_TREE=old \
 EVENTS_FILE="$EVENTS_FILE_PATH" \
 UI_HOOK="$TOOLS_X/ui_hook.sh" \
-  /root/bootguard.sh 2>&1 | tee -a /root/bootguard.log
-BG_EXIT="${PIPESTATUS[0]}"
+  /root/bootguard.sh >> /root/bootguard.log 2>&1
+BG_EXIT="$?"
+tail -5 /root/bootguard.log || true
 [ "$BG_EXIT" = 0 ] || FAIL "bootguard 全流程退出码 $BG_EXIT（查 /root/bootguard.log 与 agent.out.log）" 40
 LOG "bootguard PASS"
 
-# ---------- 5) 重挂监督环 ----------
-LOG "步骤 5：重挂 bootguard 监督环"
-bash "$TOOLS_X/bootguard-loop.sh" || LOG "WARN: 监督环启动脚本返回非零，请人工检查 /root/bootguard-loop.pid"
-
-# ---------- 6) 重拉 list_pin ----------
-# list_pin.mjs 本身是无限循环的守护脚本（钉列表最新端 + 每 15 秒全程遍历渲染），
-# 启动方式就是 node 直接跑；这里用 setsid + nohup 脱离本脚本会话长跑，防连坐。
-if pgrep -f "list_pin.mjs" >/dev/null 2>&1; then
-  LOG "步骤 6：list_pin 已在跑，跳过"
-else
-  LOG "步骤 6：启动 list_pin"
-  setsid nohup node "$TOOLS_X/list_pin.mjs" >> "$HOME/workspace/douyin-fish/list_pin.log" 2>&1 &
-  sleep 2
-  pgrep -f "list_pin.mjs" >/dev/null 2>&1 || LOG "WARN: list_pin 启动后未探到进程（agent 浏览器/CDP 未就绪时它会空转重试，可稍后看 list_pin.log）"
-fi
-
-# ---------- 7) 刷新 token ----------
-LOG "步骤 7：从 /api/bootstrap 刷新 token（不打印内容）"
+# ---------- 5) 刷新 token（必须排在挂监督环之前） ----------
+LOG "步骤 5：从 /api/bootstrap 刷新 token（不打印内容；bootwatch 靠它判活，先于监督环）"
 TOKEN="$(curl -s -m 5 "http://127.0.0.1:$API_PORT/api/bootstrap" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);console.log(j.token||"")}catch{console.log("")}})')"
 if [ -n "$TOKEN" ]; then
   printf '%s' "$TOKEN" > "$TOKEN_FILE"
   LOG "token 已存回 $TOKEN_FILE"
 else
   LOG "WARN: bootstrap 没拿到 token，agent_token.txt 未更新"
+fi
+
+# ---------- 6) 重挂监督环 ----------
+LOG "步骤 6：重挂 bootguard 监督环"
+bash "$TOOLS_X/bootguard-loop.sh" || LOG "WARN: 监督环启动脚本返回非零，请人工检查 /root/bootguard-loop.pid"
+
+# ---------- 7) 重拉 list_pin ----------
+# list_pin.mjs 本身是无限循环的守护脚本（钉列表最新端 + 每 15 秒全程遍历渲染），
+# 启动方式就是 node 直接跑；这里用 setsid + nohup 脱离本脚本会话长跑，防连坐。
+if pgrep -f "list_pin.mjs" >/dev/null 2>&1; then
+  LOG "步骤 7：list_pin 已在跑，跳过"
+else
+  LOG "步骤 7：启动 list_pin"
+  setsid nohup node "$TOOLS_X/list_pin.mjs" >> "$HOME/workspace/douyin-fish/list_pin.log" 2>&1 &
+  sleep 2
+  pgrep -f "list_pin.mjs" >/dev/null 2>&1 || LOG "WARN: list_pin 启动后未探到进程（agent 浏览器/CDP 未就绪时它会空转重试，可稍后看 list_pin.log）"
 fi
 
 # ---------- 8) 自检 ----------

@@ -44,9 +44,9 @@ bash recovery/restore-stack.sh
 3. `pip install --break-system-packages python-xlib`
 4. `cp recovery/bootguard.sh /root/bootguard.sh && chmod +x`
 5. 以 `PREFERRED_TREE=old`、`EVENTS_FILE=$HOME/workspace/dsh-src/douyin/state/chat-events.jsonl`、`UI_HOOK=$HOME/workspace/douyin-fish/tools-x/ui_hook.sh` 跑 `/root/bootguard.sh` 全流程
-6. 跑 `bootguard-loop.sh` 重挂监督环
-7. 重拉 `list_pin`（`setsid nohup node list_pin.mjs`，已在跑则跳过）
-8. 从 `GET http://127.0.0.1:3218/api/bootstrap` 取新 token 存回 `~/workspace/douyin-fish/agent_token.txt`（脚本只报成功与否，绝不打印 token）
+6. 从 `GET http://127.0.0.1:3218/api/bootstrap` 取新 token 存回 `~/workspace/douyin-fish/agent_token.txt`（脚本只报成功与否，绝不打印 token；必须排在下一步之前——`bootwatch.sh` 靠这个文件判活，拿旧 token 会误判不健康、多跑一轮恢复并多停启一次服务）
+7. 跑 `bootguard-loop.sh` 重挂监督环
+8. 重拉 `list_pin`（`setsid nohup node list_pin.mjs`，已在跑则跳过）
 9. 自检打印：桥 `http://127.0.0.1:3199/health`、agent bootstrap、私信 `chat/state` 是否 `running`
 
 手动分步恢复也可以照上面顺序逐条执行，命令都在 `restore-stack.sh` 里。
